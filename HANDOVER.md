@@ -73,11 +73,11 @@ ADOPT（提交到 rsi/<task-id> 分支，写 frontier.json）/ REJECT / NEEDS_HU
 
 ## 3. 当前真实状态（只写已验证的）
 
-### 3.1 骨架完成，pytest 87/87 通过
+### 3.1 骨架完成，pytest 161/161 通过
 
 - 语言：Python 3.10+，只用标准库（除测试依赖 pytest）。本文作者实测环境 Python 3.12.3。
-- **pytest 87/87 通过，25.8 秒**（本文作者 2026-11-13 在 `~/workspace/morde-rsi/` 用自带 `.venv` 实跑：`87 passed in 25.76s`；另用全新 venv + 只装 pytest 复核：`87 passed in 25.46s`）。测试文件 9 个：`tests/test_controller.py`、`test_critic.py`、`test_feedback.py`、`test_fixer.py`、`test_history.py`、`test_schedule.py`、`test_selection.py`、`test_verifier.py`、`test_worktree.py`（另有 `conftest.py`）。`def test_` 共 78 个，收集到 87 项（含参数化）。
-- 演进：47/47（骨架初验）→ 50/50（CAND-001 试点补了两个缺口）→ 87/87（反馈机制新增 37 个测试）。
+- **pytest 161/161 通过，约 32 秒**（2026-11-13 进化机制落地后复核：`161 passed in 32.45s`）。测试文件 12 个：`tests/test_controller.py`、`test_critic.py`、`test_feedback.py`、`test_fixer.py`、`test_history.py`、`test_schedule.py`、`test_selection.py`、`test_verifier.py`、`test_worktree.py`，新增 `test_calibrate.py`、`test_components.py`、`test_analyzer.py`（另有 `conftest.py`）。
+- 演进：47/47（骨架初验）→ 50/50（CAND-001 试点补了两个缺口）→ 87/87（反馈机制新增 37 个测试）→ 153/153（P0+P1 + self domain 落地）→ 161/161（控制器接线补完 + 7 个集成测试 + 1 个探索词汇测试）。
 - `rsi.py --domain morde smoke` 实测通过（2026-11-13 02:00 左右）：`ok: true`，go、node、npx、验证器脚本、仓库、portal package.json 都在，`evolve_tasks: 1`。注意：2026-11-13 早的 `runs/pilot-readiness-2026-11-13.md` 还记录这台 VM 缺 Go（`go: MISSING`），现在 Go 已在 `/usr/bin/go`，以本次实测为准。
 
 ### 3.2 CAND-001 第一轮：REJECT（修复本身是对的）
@@ -136,6 +136,19 @@ ADOPT（提交到 rsi/<task-id> 分支，写 frontier.json）/ REJECT / NEEDS_HU
 
 **反馈机制的验证状态**：pytest 87/87 包含反馈模块的 37 个新增测试（三票裁决 10 组矩阵、反馈转学习、脱敏/泄漏、审批卡形状、NEEDS_HUMAN 路由含 vitest FAIL 行归因等）。但注意：**NEEDS_HUMAN 路由尚未在真实 CAND-001 上跑过**——`runs/morde/` 里现在没有一张真实落盘的 CAND-001 审批卡（`approval-CAND-001-c1.json` 不存在），`history.jsonl` 里也还没有 NEEDS_HUMAN 记录；`rsi.py status` 显示 `needs_human: []`、`feedback: {human: 0, telemetry: 0}`。等第 5 节①做完才会第一次真实触发。
 
+### 3.5 进化机制（2026-11-13 新增，P0+P1 + 自我进化）
+
+用户已定 P0+P1 一起做，并要求循环能优化自己。实现在提交 `e7111ca`（本地，远端仓库未建，见第 7 节），详见 `docs/rrsi-mapping.md` 新增各节。
+
+- **calibrate（`rsi/calibrate.py`）**：bootstrap 重估计噪声带 delta，替换拍脑袋的 0.02。`domains/morde/rrsi.json` 的 delta 已是 `null`（未测量）；`rsi.py calibrate` 从 `runs/<domain>/` 下的重复基线评估算 delta，写进 `runs/<domain>/calibration.json`（永不写回 rrsi.json）；控制器每轮 BASELINE 后记基线评估、重解 delta（配置 > calibration.json > 自动校准 > 0.02 兜底），delta=null 的轮次不再崩。`RSIConfig.delta` 默认值仍是 0.02（仅键缺失时；显式 null 才走测量流程）。
+- **组件标签（`rsi/components.py`）**：Morde 语义 K 共 14 个标签（前 6 个与 `domains/morde/SKILL.md` 一致），diff 归因 + 声明须有证据否则重归因；标签记进 `history.jsonl`（`components` 列表，旧单值 `component` 保留），`component_summary()` 按组件统计胜率。新增 `text_change()`：只换字符串内容即判文案，覆盖 CAND-001 形状。
+- **停滞重定向**：`stall_flag`（RRSI 公式原样）、`exploration`、`prune_set`（Morde 自定规则：最近 `n_prune` 轮里采纳 0 次且已裁决 ≥2 次的组件进集）。停滞时 `pick_next_task()` 跳过卡住组件的任务，无任务可换报 `STALLED` 而不是 `DONE`。探索文本按 domain 词汇出（self domain 用自己的 3 个标签，不会让它去探索不存在的 portal-ui）。
+- **k-trial**：任务 JSON 可选 `k` + `flaky_checks`，只有声明抖动的检查跑 k 次，缺失计 0、分母不变，合并 `passed` 保持严格（须全部 trial 通过），不放宽 F2P/P2P 门；默认 k=1 行为不变。控制器把任务的 `k`（未声明时用配置的 `k`）传给验证器与评分。
+- **self domain（`domains/self/`）**：循环指向本项目自己。第一个真实任务 SELF-0001（全新 venv 里 `pip install -e '.[dev]'` 失败，setuptools flat-layout 报错，已复现）。**首轮自我试点已跑完，裁决 ADOPT**：基线 0.3333（A 失败、B 全绿、C 失败）→ 候选 1.0（三层全过），增益 +0.8 > delta 0.02，分支 `rsi/SELF-0001`（`60f024f`），只改 `pyproject.toml` 9 行（显式 `packages = ["rsi"]` + `[project.optional-dependencies] dev`）。**注意：main 上的 `pyproject.toml` 仍然是坏的**——修复只在 `rsi/SELF-0001` 分支上，等人工审 PR 合入后才生效；循环永不自动合并。证据：`runs/self/history.jsonl`（ADOPT 记录）、`runs/self/reward-SELF-0001-base.json` / `-c1.json`、`runs/self/frontier.json`（score 1.0）。
+- **元护栏**：自我进化时循环不能给自己改卷。保护路径：`rsi/verifier.py`、`critic.py`、`selection.py`、`feedback.py`、`analyzer.py`、`history.py`、`rsi.py`、`tests/` 全部、`domains/self/rrsi.json`、`SKILL.md`、`adapter.py`、`tasks/` 全部、`runs/` 全部。共四道门：critic（`domain="self"` 时命中即 GAMING-DETECTED，控制器已接线）+ `guards_for_diff`（命中即不可采纳）+ 物理层（建 Fixer worktree 时删掉 `domains/self/tasks/`，且该目录改动不进候选 diff）+ SKILL.md 白名单（试点期只有 `pyproject.toml`）。测试双向断言：`domain="self"` 判作弊，`domain="morde"` 放行。残余风险：任务描述本身会进任务书，Fixer 能反推考题大致内容；留出测试只断言通用性质（装包后能导入），采纳前人工审 PR。
+- **确定性分析器（`rsi/analyzer.py`，不用 LLM）**：读 `history.jsonl` + `telemetry.jsonl`，出失败聚类、组件胜率、抖动测试、遥测信号，失败簇 ≥2 条才产 evolve/留出任务草案（只产草案，不自动写进 evolve.json）。每轮的 reward 已落盘（`runs/<domain>/reward-<task>-base.json` / `-c1.json`），分析器有逐测试数据可读。LLM analyst（RRSI 的 analyst.py + digester.py）暂不做，等 DSHFixer 接通后再以 DSH Task 形式实现。
+- **借鉴其他项目**：除 RRSI 外已核对 OpenRSI（Work/Judge 分离，Apache-2.0）、DGM（父代选择公式 `wᵢ = sᵢ·hᵢ`，Apache-2.0，整套种群不做）、SWE-smith（PR Mirror 手工版造任务，MIT）、TextGrad（TGD 手工复盘 SKILL.md，MIT，引库不做）。不借的：DGM 整套种群、Gödel 运行时自改、AlphaEvolve 种群库、Meta SSR 权重训练、SWE-smith 全量管线。顺序总表见 `docs/rrsi-mapping.md` 末尾。
+
 ---
 
 ## 4. 怎么跑
@@ -151,7 +164,7 @@ python3 -m venv .venv
 .venv/bin/python -m pytest -q         # 87 passed，约 25 秒
 ```
 
-⚠️ **README 里写的 `.venv/bin/pip install -e ".[dev]"` 在当前环境跑不通**（本文作者在全新 venv 里实测失败）：setuptools 报错 `Multiple top-level packages discovered in a flat-layout: ['rsi', 'refs', 'runs', 'domains']`，因为仓库根目录有多个顶层包，自动发现拒绝继续。不要照抄这条命令；先用上面只装 pytest 的办法。修不修 `pyproject.toml`（加 `packages`/`find` 配置）由接手者定——这是个已知待修点，不是本文作者编造的。
+⚠️ **README 里写的 `.venv/bin/pip install -e ".[dev]"` 在 main 上仍然跑不通**（2026-11-13 在全新 venv 里实测失败）：setuptools 报错 `Multiple top-level packages discovered in a flat-layout: ['rsi', 'refs', 'runs', 'domains']`，因为仓库根目录有多个顶层包，自动发现拒绝继续。不要照抄这条命令；先用上面只装 pytest 的办法。**修复已存在，但只在分支上**：SELF-0001 自我试点已验证修复有效（`pyproject.toml` 加显式 `packages = ["rsi"]` + `[project.optional-dependencies] dev`），分支 `rsi/SELF-0001`（`60f024f`），等人工审 PR 合入 main 后 main 才能装；循环永不自动合并，见第 5 节⓪。
 
 已有 `.venv` 可直接用：`.venv/bin/python --version` 实测 Python 3.12.3。
 
@@ -198,6 +211,11 @@ python3 -m venv .venv
 
 ## 5. 待办清单（按优先级）
 
+### ⓪ 新增：人工审 SELF-0001 的 PR，把修复合入 main
+
+- **在等谁**：人审。分支 `rsi/SELF-0001`（`60f024f`，自我试点 ADOPT）只改 `pyproject.toml` 9 行，证据在 `runs/self/`（history.jsonl ADOPT 记录、reward-SELF-0001-base.json / -c1.json、frontier.json score 1.0）。审完合入 main（普通 git merge 到 main 即可，不要用循环的采纳路径再跑一遍），合入后在全新 venv 里跑一次 `pip install -e ".[dev]"` 确认 main 能装了。
+- **为什么必须人审**：这是自我循环第一次改自己的仓库；按元护栏，`pyproject.toml` 不在保护路径内（它是白名单内唯一可改的文件），但合入 main 仍然是人的决定，循环只产分支、不合入。
+
 ### ① 用户待定：改 Projects.test.tsx:355 的期望后重跑 CAND-001，预期 ADOPT
 
 - **在等谁**：用户决定。把 `Projects.test.tsx:355` 的断言期望从“已发送”改成“已分派任务”。
@@ -217,11 +235,12 @@ python3 -m venv .venv
 - 约束：DSH 是 Morde 唯一的 Agent Runtime，不另起第二套；Fixer 工作区与 Morde 运行环境隔离，只改 git worktree 里的代码。
 - 顺序建议：先跑完 ①②（手动 Fixer 验证循环），再接 DSHFixer 跑剩下的任务并量通过率（原计划：填 5 个真实小 bug，跑 1 个手动，剩下 4 个接 DSHFixer）。
 
-### ④ 三个留接口（都还没做）
+### ④ 三个留接口（都还没做）+ 进化机制的下一步
 
 1. **影子对比喂输入适配器**：比较器 `feedback.shadow_compare` 是实的；跑基线版和候选版取输出的适配器还没接（以后接 Morde 运行时或测试驱动）。
 2. **深度评审 UI**：只有触发条件 + 人工检查清单（`feedback.request_deep_review`），无 UI，人打开分支手工审。
 3. **反馈草案自动进 evolve.json**：`feedback_to_learning` 现在只产草案（留出测试草案 / 新 evolve 任务草案），不自动写进任务文件、不自动计分；人决定是否采纳进 `evolve.json`。
+4. **进化机制下一步（按 `docs/rrsi-mapping.md` 末尾顺序总表）**：OpenRSI 剩余收紧规则（聚合分数只给 Fixer 看、任务级预算字段、critic 白名单化）；DGM 父代选择公式 `wᵢ = sᵢ·hᵢ` 写成纯函数备而不用（等 N=3 best-of-N 或迷你 archive 时启用）；SWE-smith PR Mirror 手工版（把 1 个已合入的 Morde 小修 PR 撤销成新任务，任务池 2 → 3–4 个）；TextGrad 手工版（攒够 ≥5 条真实反馈后，按 TGD 格式复盘改写 SKILL.md/PATTERNS.md，留出任务复核 + 人审）。LLM analyst（RRSI analyst.py + digester.py）等 DSHFixer 接通后再以 DSH Task 形式实现，在此之前分析器只有确定性版本（`rsi/analyzer.py`）。
 
 其他未验证项：`playwright test` 仍未验证；Portal 侧 `node_modules` 在试点前需在主检出装好（2026-11-13 已在 `~/workspace/morde-check/web/portal` 跑过 `npm ci`，418 个包）；CO-0007 的两个待确认仍未定（小功能最终自动更新到哪里——草案建议先独立本地预览版，自动合入未定；“重大功能”的人工评审判定口径未定），这两件不挡试点 1–5，但挡第二阶段自动循环。
 
@@ -235,7 +254,7 @@ python3 -m venv .venv
 4. **验证器必须是确定性脚本，不是 Agent**：不调任何外部模型，不把 Morde 源码发到任何外部。
 5. **本地运行，不联网**：morde-rsi 不调外部模型；RRSI 的 LLM 评审已删掉。
 6. **单条 👎 不杀死候选**：单个负反馈只暂停（NEEDS_HUMAN），连续两次才驳回。
-7. **采纳要过噪声下限 delta=0.02**：`domains/morde/rrsi.json` 的 delta 是试点期初值（RRSI coding 实例是 0.017，由 calibrate 从基线 bootstrap 得来；morde-rsi 是按检查数拍脑袋的初值，**不是测出来的**），第一个真实试点跑完后用基线重复测量的方差重估计。
+7. **采纳要过噪声下限**：`domains/morde/rrsi.json` 的 delta 现在是 `null`（未测量），不再是拍脑袋的 0.02；`rsi.py calibrate` 可从重复基线评估重估计（bootstrap，见 `rsi/calibrate.py`），测出的值进 `runs/<domain>/calibration.json`；控制器每轮 BASELINE 后自动重解（配置 > calibration.json > 自动校准 > 0.02 兜底），来源记进 round summary。`RSIConfig.delta` 默认值仍是 0.02（仅键缺失时）。`domains/self/rrsi.json` 的 delta 仍是 0.02（未测量，沿用 morde 试点值）。
 8. **模拟的都要明确标注为模拟**：测试与手动 Fixer 模式在账本里标 `fixer="manual-pilot"`，不能冒充 DSH 跑的结果。
 9. **每 bug 最多 3 次提交**（`max_submissions: 3`）；token/时间预算见 `domains/morde/rrsi.json`。
 10. **不要编造 bug**：进 `evolve.json` 的任务必须是真实（用户报过、或测试失败过、或亲手复现过）、小（A 级，一个函数内能说清）、可复现（先写出失败的测试或命令，基线跑一遍确认失败）。`heldout.json` 现在是空列表（试点期先用 evolve 任务的 tier C 做留出测量）。
@@ -244,12 +263,12 @@ python3 -m venv .venv
 
 ## 7. 仓库与分支状态
 
-- **morde-rsi 当时还不是 git 仓库**（本文作者 2026-11-13 核实：`git status` 报 `fatal: not a git repository`）。**不要假设它已经推上去了**——按上游要求，需要时再 `git init`、首次提交并推到指定远端，推之前先确认远端地址和分支名。
+- **morde-rsi 已是 git 仓库（本地，2026-11-13）**：`main` 分支两个提交——`dc5acfd`（骨架 + 反馈机制 + 交接文档，44 文件）与 `e7111ca`（进化机制：calibrate、组件标签、停滞重定向、k-trial、self domain、元护栏、分析器，31 文件）。远端 `origin` 已设为 `git@github.com:lizhongxuan/morde-rsi.git`，但该仓库在 GitHub 上还不存在（GitHub App 建库回 403），**不要假设它已经推上去了**——需用户在 GitHub 上建空仓库并加好带写权限的 deploy key 后再推，推之前先确认远端地址和分支名。
 - `.gitignore` 已备好（仓库根），排除：`.venv/`、`__pycache__/`、`*.pyc`、`.pytest_cache/`、`refs/`、`runs/`、`*.egg-info/`。
 - **`refs/rrsi/` 是 RRSI 参考克隆，不进仓库**（`.gitignore` 已排除；README 说需自行 `git clone https://github.com/google-research/rrsi.git refs/rrsi`，但本机 `refs/rrsi` 已存在——是 2026-11-13 拉的 `--depth 1` 参考版本）。
-- **`runs/` 是本地证据，不进仓库**（`.gitignore` 已排除）。里面有：`runs/morde/history.jsonl`（1 条 CAND-001 REJECT 记录）、`runs/morde/evidence-CAND-001*`（三个证据目录：`evidence-CAND-001`、`evidence-CAND-001-base`、`evidence-CAND-001-base-direct`，各含 A-0/A-1/B-0/B-1/C-0.log）、`runs/pilot-readiness-2026-11-13.md`。无 `frontier.json`、无 `human_feedback.jsonl`、无 `telemetry.jsonl`（反馈账本还是空的，`status` 显示 human 0 / telemetry 0）。
+- **`runs/` 是本地证据，不进仓库**（`.gitignore` 已排除）。里面有：`runs/morde/history.jsonl`（1 条 CAND-001 REJECT 记录）、`runs/morde/evidence-CAND-001*`（三个证据目录：`evidence-CAND-001`、`evidence-CAND-001-base`、`evidence-CAND-001-base-direct`，各含 A-0/A-1/B-0/B-1/C-0.log）、`runs/pilot-readiness-2026-11-13.md`；新增 `runs/self/`（SELF-0001 自我试点：`history.jsonl` 1 条 ADOPT 记录、`frontier.json` score 1.0、`reward-SELF-0001-base.json` / `-c1.json`、`baseline-eval-SELF-0001-1.json`、证据目录 `evidence-SELF-0001*`）。`runs/morde/` 仍无 `frontier.json`、无 `human_feedback.jsonl`、无 `telemetry.jsonl`（反馈账本还是空的，`status` 显示 human 0 / telemetry 0）。
 - **Morde 仓库状态**（`~/workspace/morde-check`，本文作者 2026-11-13 核实）：detached HEAD，HEAD `273d300`（“导入iOS端”）。`git status --short` 有 12 个未提交改动，全部在 `web/portal/`：`M schema.d.ts`、`M app/api.test.ts`、`A app/k2-task-projection.test.ts`、`A app/k2-task-projection.ts`、`M mocks/handlers.test.ts`、`M mocks/handlers.ts`、`A mocks/k2-task-fixture.ts`、`M routes/Assistant.test.tsx`、`M routes/Assistant.tsx`、`M routes/Projects.test.tsx`、`M routes/Projects.tsx`、`M styles.css`。**这些改动不是 RSI 做的，RSI 没动过这个仓库；别动也别推。** 另注意：2026-11-12 日报提到的 Morde 新 HEAD 是 `6317715`，本地检出还停在旧的 `273d300`，试点基线必须对着新 HEAD 重新拉、重新量（见 `runs/pilot-readiness-2026-11-13.md`）。
-- 分支：RSI 采纳的分支命名是 `rsi/<task-id>`（如 `rsi/CAND-001`）；目前没有任何 `rsi/*` 分支存在（CAND-001 是 REJECT，未建分支）。
+- 分支：RSI 采纳的分支命名是 `rsi/<task-id>`（如 `rsi/CAND-001`）。现有一个：`rsi/SELF-0001`（`60f024f`，自我试点 ADOPT，只改 `pyproject.toml` 9 行，等人工审 PR 合入 main，见第 5 节⓪）。CAND-001 是 REJECT，未建分支。
 
 ---
 
@@ -257,23 +276,28 @@ python3 -m venv .venv
 
 | 数字 | 值 | 证据位置 |
 |---|---|---|
-| pytest | **87/87 通过，约 25 秒**（本文作者实跑两次：25.76s、25.46s） | `tests/`（9 个文件，`def test_` 78 个，收集 87 项） |
+| pytest | **161/161 通过，约 32 秒**（2026-11-13 进化机制落地后复核：`161 passed in 32.45s`） | `tests/`（12 个文件） |
 | 骨架初验 | 47/47 通过，14.7 秒 | 2026-11-13 验收记录（`~/MEMORY.md`） |
 | CAND-001 试点后 | 50/50 | 同上 |
+| 反馈机制后 | 87/87 | 同上 |
+| 进化机制后 | 161/161（153 落地 + 7 集成测试 + 1 探索词汇测试） | `tests/`，提交 `e7111ca` |
 | CAND-001 基线 score | 0.6（A 失败、C 失败、B 529/529） | `runs/morde/history.jsonl`、`runs/morde/evidence-CAND-001-base*` |
 | CAND-001 候选 score | 0.8（A 通过、C 3/3、B 528/529） | `runs/morde/history.jsonl`、`runs/morde/evidence-CAND-001/` |
 | 唯一失败测试 | `Projects.test.tsx:355`（期望“已发送”，应为“已分派任务”） | `runs/morde/evidence-CAND-001/B-*.log` |
-| 噪声下限 | delta=0.02（试点初值，未实测重估） | `domains/morde/rrsi.json` |
+| 噪声下限 | morde：delta=null（未测量；`rsi.py calibrate` 可重估计）；self：delta=0.02（未测量） | `domains/morde/rrsi.json`、`domains/self/rrsi.json`、`rsi/calibrate.py` |
 | Morde 基线失败测试 | worker 包 46 个（43 握手 + 3 浏览器超时）、app 包 1 个 | `docs/rrsi-mapping.md`“基线发现”一节 |
 | Portal 基线 | 51 文件 / 529 测试全过；`npm ci` 418 个包，约 6 秒 | `docs/rrsi-mapping.md`、CANDIDATES.md |
 | 反馈模块 | `rsi/feedback.py` 669 行；新增测试 37 个 | `rsi/feedback.py`、`tests/test_feedback.py` |
-| 账本 | 1 条记录（CAND-001 REJECT，2026-11-13 01:19:11） | `runs/morde/history.jsonl` |
-| 任务 | evolve.json 有 1 个真实任务（CAND-001）；heldout.json 为空列表；CAND-002 是草案文件，未进 evolve.json | `domains/morde/tasks/evolve.json`、`heldout.json`、`CAND-002.evolve.json` |
+| 进化模块 | `rsi/calibrate.py`、`rsi/components.py`、`rsi/analyzer.py`（新）；`domains/self/`（新） | `rsi/`、`domains/self/`、`docs/rrsi-mapping.md` 新增各节 |
+| 账本（morde） | 1 条记录（CAND-001 REJECT，2026-11-13 01:19:11） | `runs/morde/history.jsonl` |
+| 账本（self） | 1 条记录（SELF-0001 ADOPT，2026-11-13 02:30:36，score 1.0） | `runs/self/history.jsonl`、`runs/self/frontier.json` |
+| SELF-0001 试点 | 基线 0.3333（A 失败、B 全绿、C 失败）→ 候选 1.0（三层全过），分支 `rsi/SELF-0001`（`60f024f`，只改 `pyproject.toml` 9 行），99.3 秒 | `runs/self/`、`git show rsi/SELF-0001 --stat` |
+| 任务 | morde evolve.json 有 1 个真实任务（CAND-001）；heldout.json 为空列表；CAND-002 是草案文件，未进 evolve.json；self evolve.json 有 1 个真实任务（SELF-0001） | `domains/morde/tasks/`、`domains/self/tasks/` |
 | Morde 本地检出 | HEAD `273d300`，detached，12 个未提交改动 | `~/workspace/morde-check` |
 
 ### 读文档的顺序建议
 
-1. 本文件（全貌）→ 2. `README.md`（架构与怎么跑）→ 3. `docs/rrsi-mapping.md`（RRSI 对照、基线发现、CAND-001 试点全记录、反馈机制全记录）→ 4. `domains/morde/README.md`（任务怎么填、环境要求、守卫）→ 5. `domains/morde/tasks/CANDIDATES.md`（候选池、为什么只有 2 个过硬候选）→ 6. `rsi/controller.py`、`rsi/feedback.py` 的文件头注释（循环与反馈的设计原意）。
+1. 本文件（全貌）→ 2. `README.md`（架构与怎么跑）→ 3. `docs/rrsi-mapping.md`（RRSI 对照、基线发现、CAND-001 试点全记录、反馈机制全记录、进化机制、自我进化与元护栏、借鉴其他项目）→ 4. `domains/morde/README.md`（任务怎么填、环境要求、守卫）→ 5. `domains/morde/tasks/CANDIDATES.md`（候选池、为什么只有 2 个过硬候选）→ 6. `rsi/controller.py`、`rsi/feedback.py` 的文件头注释（循环与反馈的设计原意）。
 
 ### 背景出处
 

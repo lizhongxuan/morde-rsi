@@ -75,7 +75,8 @@ class Controller:
                  feedback_log: fb.FeedbackLog | None = None,
                  telemetry_log: fb.FeedbackLog | None = None,
                  domain: str | None = None, domain_patterns=None,
-                 worktree_excludes: list[str] | None = None):
+                 worktree_excludes: list[str] | None = None,
+                 domain_components: list[str] | None = None):
         self.repo = Path(repo)
         self.runs_dir = Path(runs_dir)
         self.tasks_file = Path(tasks_file)
@@ -93,6 +94,12 @@ class Controller:
         self.domain = domain
         self.domain_patterns = list(domain_patterns or [])
         self.worktree_excludes = list(worktree_excludes or [])
+        # Component vocabulary for stall/exploration text: the domain's
+        # own COMPONENTS when it declares one, else Morde's K. Without
+        # this the self loop would be told to explore Morde-only
+        # components (e.g. portal-ui) that do not exist in its repo.
+        self.domain_components = (list(domain_components)
+                                  if domain_components else None)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.history = history or History(self.runs_dir / "history.jsonl")
         # Feedback logs (rsi/feedback.py). human_feedback.jsonl is what a
@@ -179,7 +186,8 @@ class Controller:
         return {"trajectory": extended, "t": t, "stall": stall,
                 "tried": sorted(tried),
                 "exploration": exploration(t, stall, tried,
-                                           self.cfg.m_draft),
+                                           self.cfg.m_draft,
+                                           self.domain_components),
                 "prune_set": self.history.prune_set(t, self.cfg.n_prune)}
 
     def _eligible_tasks(self, apply_stall: bool) -> list[dict]:

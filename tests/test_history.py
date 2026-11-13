@@ -142,3 +142,16 @@ def test_prune_set_morde_rule(tmp_path):
     assert [p["component"] for p in pruned] == ["docs", "logic-small"]
     # Round 0: no history yet, nothing to prune.
     assert History(tmp_path / "empty.jsonl").prune_set(0, 4) == []
+
+
+def test_exploration_uses_domain_vocabulary():
+    # The self domain must not be told to explore Morde-only components
+    # (e.g. portal-ui) that do not exist in its repo.
+    from rsi.history import exploration
+    got = exploration(0, 0, set(), 1,
+                      vocabulary=["config-default", "logic-small", "docs"])
+    assert got["untried"] == ["config-default", "logic-small", "docs"]
+    assert "portal-ui" not in got["text"]
+    got2 = exploration(0, 0, {"config-default"}, 1,
+                       vocabulary=["config-default", "logic-small", "docs"])
+    assert got2["untried"] == ["logic-small", "docs"]

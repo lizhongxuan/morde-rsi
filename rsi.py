@@ -140,7 +140,9 @@ def main():
                          domain.root / "tasks" / "evolve.json", cfg, None,
                          domain=args.domain,
                          domain_patterns=getattr(domain, "critic_patterns",
-                                                 None))
+                                                 None),
+                         domain_components=getattr(domain, "components",
+                                                   None))
         print(json.dumps(ctl.status(), indent=1, ensure_ascii=False))
         return 0
 
@@ -160,7 +162,9 @@ def main():
                      domain_patterns=getattr(domain, "critic_patterns",
                                              None),
                      worktree_excludes=getattr(
-                         domain, "fixer_worktree_excludes", None))
+                         domain, "fixer_worktree_excludes", None),
+                     domain_components=getattr(domain, "components",
+                                               None))
 
     if args.cmd == "baseline":
         task = ctl.pick_next_task()

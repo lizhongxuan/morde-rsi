@@ -44,14 +44,20 @@ def stall_flag(trajectory: list[float], t: int, w: int, delta: float) -> int:
     return int(trajectory[t] - trajectory[t - w] <= delta)
 
 
-def exploration(t: int, stall: int, tried: set[str], m_draft: int) -> dict:
+def exploration(t: int, stall: int, tried: set[str], m_draft: int,
+                vocabulary: list[str] | None = None) -> dict:
     """E_t = (sigma_t, U_t, m_draft) plus the text handed to the proposer.
 
     Ported from RRSI rrsi/history.py::exploration: same shape and keys
     (``sigma`` / ``untried`` / ``m_draft`` / ``text``), untried computed
-    over Morde's K; the text is rewritten in Chinese for Morde.
+    over Morde's K by default; the text is rewritten in Chinese for Morde.
+    `vocabulary` overrides K for other domains (the self domain has its
+    own small vocabulary: config-default / logic-small / docs -- without
+    this the self loop would be told to explore Morde-only components
+    such as portal-ui that do not exist in its repo).
     """
-    untried = [c for c in K if c not in tried]
+    vocab = vocabulary or K
+    untried = [c for c in vocab if c not in tried]
     if stall and untried:
         text = (f"停滞：基线分数在最近几轮里没有超出噪声带（sigma_t = 1）。"
                 f"本轮保留 {m_draft} 个候选位置给从未试过的组件：{untried}。"
