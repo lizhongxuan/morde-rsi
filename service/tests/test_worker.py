@@ -339,12 +339,10 @@ def test_e2e_api_fixer_adopt(tmp_path, monkeypatch, fixture_repo,
     port = srv.server_address[1]
     config = _config(tmp_path, f"http://127.0.0.1:{port}")
     store = JobStore(tmp_path / "store")
-    # Domain "morde", not "self": domains/self/SKILL.md names the feedback
-    # ledger files (telemetry.jsonl / human_feedback.jsonl) literally, and
-    # rsi/critic.py::review_brief rejects any brief containing those names,
-    # so an LLM fixer can never start on the self domain today (pinned by
-    # test_api_fixer_self_skill_md_blocked below; follow-up in HANDOVER §9).
-    # The morde SKILL.md passes the same check.
+    # Domain "morde": the fixture repo is shaped like the morde domain.
+    # (The self domain's SKILL.md previously tripped the brief leak-check
+    # by naming ledger files; that is fixed — see
+    # test_api_fixer_self_skill_md_passes_brief_check below.)
     store.create_job(domain="morde", repo=str(repo),
                      task=_e2e_task(repro, heldout), fixer="api")
     worker = Worker(config, store)
@@ -370,30 +368,29 @@ def test_e2e_api_fixer_adopt(tmp_path, monkeypatch, fixture_repo,
     assert worker.run_once() is None
 
 
-def test_api_fixer_self_skill_md_blocked(tmp_path, fixture_repo, stub_model):
-    """PINNED KNOWN LIMITATION (2026-11-13): the self domain cannot use an
-    LLM fixer yet. domains/self/SKILL.md names telemetry.jsonl /
-    human_feedback.jsonl literally, and rsi/critic.py::review_brief
-    rejects any brief containing those filenames, so APIFixer.fix()
-    raises before any HTTP call (the stub server is never hit). DSHFixer
-    runs the same check, so the real DSH wiring would hit the same wall.
-    The fix belongs in rsi/critic.py (narrow the ledger patterns so rules
-    text naming protected files is not treated as leaked material) or in
-    domains/self/SKILL.md (don't name the files) — both outside service/.
-    If that fix lands, delete this test and switch the API E2E back to
-    domain "self".
+def test_api_fixer_self_skill_md_passes_brief_check(fixture_repo, stub_model):
+    """The self domain can use an LLM fixer (fixed 2026-11-13):
+    domains/self/SKILL.md no longer names the feedback ledger files
+    literally, so rsi/critic.py::review_brief accepts the rendered
+    brief and APIFixer.fix() reaches the model and applies its diff.
     """
     repo, _, _ = fixture_repo
     srv = stub_model()
     port = srv.server_address[1]
+    from rsi import critic as critic_mod
+    from rsi.fixer import render_brief
     from service.fixer_api import APIFixer
     skill_md = (ROOT / "domains" / "self" / "SKILL.md").read_text()
-    assert "telemetry.jsonl" in skill_md
+    assert "telemetry.jsonl" not in skill_md
+    brief = render_brief({"task_id": "E2E-001", "description": "x"},
+                         repo, skill_md, 3)
+    assert critic_mod.review_brief(brief)["verdict"] == "accept"
     fixer = APIFixer(base_url=f"http://127.0.0.1:{port}", model="stub",
                      api_key="test-key", skill_md=skill_md)
-    with pytest.raises(RuntimeError, match="feedback ledger"):
-        fixer.fix({"task_id": "E2E-001", "description": "x", "tiers": {}},
-                  repo, {"max_submissions": 3})
+    result = fixer.fix({"task_id": "E2E-001", "description": "x",
+                        "tiers": {}}, repo, {"max_submissions": 3})
+    assert result.diff == E2E_DIFF
+    assert "return a + b" in (repo / "calc.py").read_text()
 
 
 def test_load_domain_not_poisoned_by_top_level_adapter_import():

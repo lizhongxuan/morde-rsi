@@ -388,13 +388,13 @@ morde domain 的仓库路径须在容器内存在或改配置覆盖（见 `servi
    次运行在 `git worktree add -b` 处失败（实测）。这是 rsi/ 里的旧问
    题（服务层不改 rsi/，未修）；清掉办法：`git worktree remove --force
    <残留路径>` + `git branch -D rsi/<task-id>`。
-7. **self domain 目前接不了 LLM Fixer**：domains/self/SKILL.md 逐字
-   写了 `telemetry.jsonl` / `human_feedback.jsonl`，而
-   rsi/critic.py::review_brief 拒收任何含这两个文件名的任务书，所以
-   APIFixer（DSHFixer 也一样，它走同一检查）在 self domain 上没调
-   模型就抛错。E2E 测试因此用 morde domain 跑；墙本身已钉成测试
-   `test_api_fixer_self_skill_md_blocked`。修法在 rsi/critic.py（收窄
-   账本文件名模式）或 domains/self/SKILL.md（不逐字写文件名）二选一。
+7. ~~**self domain 接不了 LLM Fixer**~~ **已修（2026-11-13）**：
+   domains/self/SKILL.md 不再逐字写账本文件名（改成"历史记录、人工
+   反馈、遥测信号等一切账本文件"），rsi/critic.py::review_brief 放行，
+   APIFixer 在 self domain 上能正常调模型；回归测试
+   `test_api_fixer_self_skill_md_passes_brief_check` 钉住。注意 brief
+   里仍禁止出现真实的留出测试内容——任务描述若逐字抄了考题文件名，
+   还是会被拦，这是对的。
 
 ### 9.5 集成验证记录（2026-11-13，协调人实跑）
 

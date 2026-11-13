@@ -29,8 +29,8 @@ worktree 中的代码。你改的东西会被一个**独立的、确定性的验
   `domains/self/SKILL.md`（本文件——你不能改写自己的宪法）、
   `domains/self/adapter.py`（评分与验证接线）、`domains/self/tasks/`
   全部（任务定义、复现测试、留出测试——你不能改写自己的考题）
-- 账本与证据：`runs/` 全部（`history.jsonl`、`telemetry.jsonl`、
-  `human_feedback.jsonl`、`reward.json`、审批卡、证据日志）
+- 账本与证据：`runs/` 全部（历史记录、人工反馈、遥测信号、
+  奖励结果、审批卡、证据日志等一切账本文件）
 - 任何需要联网、发请求、读用户数据的改动
 
 碰了上面任何一条，critic 直接判 `GAMING-DETECTED`，候选作废并记账。
