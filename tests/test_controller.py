@@ -276,3 +276,223 @@ def test_vitest_fail_without_declared_tests_stays_reject(fixture_repo,
     summary = ctl.run_task(task, 0)
     assert summary["verdict"] == "REJECT", summary
     assert not (runs / "approval-FIX-001-c1.json").exists()
+
+
+# ------------------------------------------------- stall redirect (components) --
+def _stalled_history(ctl, improving: bool = False):
+    """Four flat REJECT rounds (scores 0.5) so the run is stalled
+    (w=3, delta=0.02, trajectory [0,0,0,0] + incumbent 0.0). logic-small
+    fails 3x in a row -> stuck; portal-ui fails once -> not stuck.
+    With improving=True an ADOPT at round 2 lifts the trajectory, so
+    the run is NOT stalled even though logic-small stays stuck."""
+    h = ctl.history
+    for rnd, (tid, comp, verdict, score) in enumerate([
+            ("S1", "logic-small", "REJECT", 0.5),
+            ("S2", "logic-small", "REJECT", 0.5),
+            ("S3", "portal-ui", "ADOPT" if improving else "REJECT",
+             0.7 if improving else 0.5),
+            ("S4", "logic-small", "REJECT", 0.5)]):
+        h.append_candidate(rnd, tid, "c1", "A", comp, None, "d", {},
+                           verdict, "aaa", score, None, 1.0)
+
+
+def _stall_tasks(heldout_dir, components):
+    tasks = []
+    for i, comp in enumerate(components):
+        t = make_task(f"T{i + 1}", heldout_src=heldout_dir)
+        t["component"] = comp
+        tasks.append(t)
+    return tasks
+
+
+def test_pick_next_task_skips_stuck_component_when_stalled(
+        fixture_repo, heldout_dir, tmp_path):
+    tasks = _stall_tasks(heldout_dir, ["logic-small", "portal-ui"])
+    ctl, _ = _ctl(tmp_path, fixture_repo, tasks,
+                  ManualFixer(_diff_file(tmp_path, FIX_DIFF)))
+    _stalled_history(ctl)
+    assert ctl._stall_state()["stall"] == 1
+    nxt = ctl.pick_next_task()
+    assert nxt is not None and nxt["task_id"] == "T2"
+    assert nxt["component"] == "portal-ui"
+
+
+def test_pick_next_task_none_and_run_stalled_when_all_stuck(
+        fixture_repo, heldout_dir, tmp_path):
+    tasks = _stall_tasks(heldout_dir, ["logic-small"])
+    ctl, _ = _ctl(tmp_path, fixture_repo, tasks,
+                  ManualFixer(_diff_file(tmp_path, FIX_DIFF)))
+    _stalled_history(ctl)
+    assert ctl.pick_next_task() is None
+    summaries = ctl.run()
+    assert summaries[0]["verdict"] == "STALLED"
+    assert "stuck" in summaries[0]["detail"]
+
+
+def test_pick_next_task_no_skip_when_not_stalled(
+        fixture_repo, heldout_dir, tmp_path):
+    tasks = _stall_tasks(heldout_dir, ["logic-small", "portal-ui"])
+    ctl, _ = _ctl(tmp_path, fixture_repo, tasks,
+                  ManualFixer(_diff_file(tmp_path, FIX_DIFF)))
+    _stalled_history(ctl, improving=True)
+    assert ctl._stall_state()["stall"] == 0
+    # logic-small is still stuck, but without a stall there is no skip.
+    assert ctl.history.stuck_components() == {"logic-small"}
+    assert ctl.pick_next_task()["task_id"] == "T1"
+
+
+class _CapturingFixer(ManualFixer):
+    """ManualFixer that keeps the task dict it was handed (the brief)."""
+
+    def fix(self, task, worktree, budget):
+        self.seen = dict(task)
+        return super().fix(task, worktree, budget)
+
+
+def test_stalled_round_carries_exploration_to_fixer_and_ledger(
+        fixture_repo, heldout_dir, tmp_path):
+    task = make_task(heldout_src=heldout_dir)
+    fixer = _CapturingFixer(_diff_file(tmp_path, FIX_DIFF))
+    ctl, runs = _ctl(tmp_path, fixture_repo, [task], fixer)
+    _stalled_history(ctl)
+    summary = ctl.run_task(task, 4)
+    assert summary["verdict"] == "ADOPT", summary
+    assert summary["stall"] == 1
+    assert "停滞" in summary["exploration"]
+    assert summary["prune_set"][0]["component"] == "logic-small"
+    # The brief the Fixer got carries the redirection (fixer.py untouched:
+    # the dict is the carrier, render_brief has no exploration slot).
+    assert fixer.seen["exploration"] == summary["exploration"]
+    assert fixer.seen["stall_flag"] == 1
+    assert fixer.seen["prune_set"] == ["logic-small"]
+    # The round's ledger record carries the stall note + the label the
+    # diff evidences (calc.py -> logic-small).
+    recs = [json.loads(l)
+            for l in (runs / "history.jsonl").read_text().splitlines()]
+    assert "stall=1" in recs[-1]["detail"]
+    assert recs[-1]["components"] == ["logic-small"]
+    assert recs[-1]["component"] == "logic-small"
+    # status() after the round: the ADOPT moved the incumbent to 1.0,
+    # so the stall is broken (stall=0) and the prune clears (logic-small
+    # now has an adoption in the window). That is the mechanism working:
+    # a stalled run that finally adopts stops being stalled.
+    status = ctl.status()
+    assert status["stall"] == 0
+    assert status["component_summary"]["logic-small"] == {
+        "attempts": 4, "adopt": 1, "reject": 3, "decided": 4,
+        "win_rate": 0.25}
+    assert status["prune_set"] == []
+
+
+# ---- integration: delta resolution, critic domain wiring, pytest FAIL ----
+def test_resolve_delta_fallback_when_unmeasured(tmp_path, fixture_repo):
+    tasks_file = write_tasks_file(tmp_path, [])
+    cfg = RSIConfig.load(None)
+    cfg.delta = None
+    ctl = Controller(fixture_repo, tmp_path / "runs", tasks_file, cfg, None)
+    assert ctl._resolve_delta(allow_calibrate=False) == (
+        0.02, "fallback-0.02-unmeasured")
+    # No baseline evaluations on disk: auto-calibration has nothing to
+    # read, so it must fall back too -- never invent a delta.
+    assert ctl._resolve_delta(allow_calibrate=True) == (
+        0.02, "fallback-0.02-unmeasured")
+
+
+def test_resolve_delta_reads_calibration_json(tmp_path, fixture_repo):
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    (runs / "calibration.json").write_text(json.dumps({"delta": 0.05}))
+    tasks_file = write_tasks_file(tmp_path, [])
+    cfg = RSIConfig.load(None)
+    cfg.delta = None
+    ctl = Controller(fixture_repo, runs, tasks_file, cfg, None)
+    assert ctl._resolve_delta() == (0.05, "calibration.json")
+
+
+def test_delta_none_round_completes_without_crash(
+        fixture_repo, heldout_dir, tmp_path):
+    # delta=null with no calibration file used to crash judge() with a
+    # TypeError; the round must now complete (fallback/auto-calibrated).
+    task = make_task(heldout_src=heldout_dir)
+    tasks_file = write_tasks_file(tmp_path, [task])
+    runs = tmp_path / "runs"
+    cfg = RSIConfig.load(None)
+    cfg.delta = None
+    ctl = Controller(fixture_repo, runs, tasks_file, cfg,
+                     ManualFixer(_diff_file(tmp_path, FIX_DIFF)))
+    summary = ctl.run_task(task, 0)
+    assert summary["verdict"] == "ADOPT", summary
+    assert isinstance(summary["delta"], float)
+    assert summary["delta_source"] in ("auto-calibrated",
+                                       "fallback-0.02-unmeasured")
+    # Baseline measurement was persisted for later calibration/analysis.
+    assert (runs / "reward-FIX-001-base.json").exists()
+    assert (runs / "reward-FIX-001-c1.json").exists()
+    assert list(runs.glob("baseline-eval-FIX-001-*.json"))
+
+
+def test_failed_files_from_evidence_parses_pytest(tmp_path):
+    from rsi.controller import _failed_files_from_evidence
+    ev = tmp_path / "evidence"
+    ev.mkdir()
+    (ev / "B-0.log").write_text(
+        "FAILED tests/test_packaging_repro.py::test_x - assert False\n"
+        "FAILED tests/test_other.py::test_y\n")
+    assert _failed_files_from_evidence(ev) == [
+        "tests/test_other.py", "tests/test_packaging_repro.py"]
+    # vitest style still works alongside.
+    (ev / "B-1.log").write_text(
+        "FAIL  web/portal/src/routes/Projects.test.tsx\n")
+    assert "web/portal/src/routes/Projects.test.tsx" in (
+        _failed_files_from_evidence(ev))
+
+
+def test_self_domain_critic_blocks_verifier_edit(tmp_path):
+    # The self loop grades its own repo: a diff touching the verifier
+    # must be GAMING-DETECTED by the critic (first gate), never evaluated.
+    # The fixture repo contains rsi/verifier.py so the manual diff applies.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "rsi-test@example.invalid")
+    _git(repo, "config", "user.name", "rsi-test")
+    (repo / "rsi").mkdir()
+    (repo / "rsi" / "verifier.py").write_text("PASS = False\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "fixture")
+    task = {
+        "task_id": "SELF-TEST-1",
+        "title": "x",
+        "description": "x",
+        "component": "config-default",
+        "hypothesis": "x",
+        "tiers": {
+            "A": {"commands": [["false"]], "timeout_s": 30},
+            "B": {"commands": [["true"]], "timeout_s": 30},
+            "C": {"commands": [["true"]], "timeout_s": 30},
+        },
+    }
+    diff = ("diff --git a/rsi/verifier.py b/rsi/verifier.py\n"
+            "--- a/rsi/verifier.py\n+++ b/rsi/verifier.py\n"
+            "@@ -1 +1 @@\n-PASS = False\n+PASS = True\n")
+    tasks_file = write_tasks_file(tmp_path, [task])
+    runs = tmp_path / "runs"
+    ctl = Controller(repo, runs, tasks_file, RSIConfig.load(None),
+                     ManualFixer(_diff_file(tmp_path, diff)), domain="self")
+    summary = ctl.run_task(task, 0)
+    assert summary["verdict"] == "GAMING-DETECTED", summary
+    assert "verifier module touched" in summary["detail"]
+
+
+def test_morde_domain_same_diff_is_not_self_gaming(tmp_path):
+    # The same verifier-editing diff under the morde domain is still
+    # caught by the generic list (verifier is protected for every domain),
+    # but a self-only path (e.g. rsi.py) is NOT gaming for morde: the
+    # morde Fixer works in the Morde repo and can never reach it.
+    from rsi import critic as critic_mod
+    diff_rsi_py = ("diff --git a/rsi.py b/rsi.py\n"
+                   "--- a/rsi.py\n+++ b/rsi.py\n"
+                   "@@ -1 +1 @@\n-x = 1\n+x = 2\n")
+    assert critic_mod.review(diff_rsi_py, domain="self")["gaming"] is True
+    assert critic_mod.review(diff_rsi_py, domain="morde")["verdict"] == "accept"
+    assert critic_mod.review(diff_rsi_py)["verdict"] == "accept"

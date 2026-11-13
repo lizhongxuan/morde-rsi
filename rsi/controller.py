@@ -21,6 +21,7 @@ A STOP file in the runs dir ends the run gracefully after the current round.
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from pathlib import Path
 
@@ -28,23 +29,26 @@ from . import critic as critic_mod
 from . import feedback as fb
 from . import selection as sel
 from . import worktree as wt
+from .calibrate import (auto_calibrate, read_calibration,
+                        record_baseline_eval)
+from .components import normalize as normalize_component
 from .config import RSIConfig
 from .fixer import FixResult
-from .history import History
+from .history import History, exploration, stall_flag
 from .verifier import Reward, run_verifier
 
 
 def _failed_files_from_evidence(evidence_dir: Path | str,
                                 tier: str = "B") -> list[str]:
-    """Failing test files named in a tier's evidence logs (vitest/jest style).
+    """Failing test files named in a tier's evidence logs.
 
-    The per-test P2P map only exists for go-test-json tiers. Portal tiers
-    run plain `vitest run`, whose evidence log prints lines like
-    ``FAIL  web/portal/src/routes/Projects.test.tsx``. This parser reads
-    those lines so the NEEDS_HUMAN router can still attribute a lone
-    failure. Returns [] when nothing parseable is found (caller must then
-    treat the failure as unattributable, i.e. a clear regression, not an
-    ambiguous one).
+    The per-test P2P map only exists for go-test-json tiers. Plain-command
+    tiers name their failures in the log instead: vitest/jest print lines
+    like ``FAIL  web/portal/src/routes/Projects.test.tsx`` and pytest -q
+    prints ``FAILED tests/test_x.py::test_y - ...``. This parser reads both
+    so the NEEDS_HUMAN router can still attribute a lone failure. Returns
+    [] when nothing parseable is found (caller must then treat the failure
+    as unattributable, i.e. a clear regression, not an ambiguous one).
     """
     import re
     out: set[str] = set()
@@ -56,6 +60,10 @@ def _failed_files_from_evidence(evidence_dir: Path | str,
             m = re.match(r"\s*FAIL\s+(\S+)", line)
             if m:
                 out.add(m.group(1))
+                continue
+            m = re.match(r"\s*FAILED\s+(\S+?)(?:::|\s+-|\s*$)", line)
+            if m:
+                out.add(m.group(1))
     return sorted(out)
 
 
@@ -65,7 +73,9 @@ class Controller:
                  fixer=None, history: History | None = None,
                  skill_md: str = "", guard_fn=None,
                  feedback_log: fb.FeedbackLog | None = None,
-                 telemetry_log: fb.FeedbackLog | None = None):
+                 telemetry_log: fb.FeedbackLog | None = None,
+                 domain: str | None = None, domain_patterns=None,
+                 worktree_excludes: list[str] | None = None):
         self.repo = Path(repo)
         self.runs_dir = Path(runs_dir)
         self.tasks_file = Path(tasks_file)
@@ -73,6 +83,16 @@ class Controller:
         self.fixer = fixer
         self.skill_md = skill_md
         self.guard_fn = guard_fn  # callable diff -> list[str] violations
+        # Domain identity for the critic (domain="self" turns on the
+        # meta-guardrail blacklist; any other value leaves it off) and
+        # the domain's own critic patterns (RRSI: domain patterns apply
+        # on top of the generic protected list). worktree_excludes are
+        # worktree-relative paths removed from the Fixer worktree before
+        # it starts (self domain: the task material, so the Fixer cannot
+        # read its own exam) and excluded from its diff.
+        self.domain = domain
+        self.domain_patterns = list(domain_patterns or [])
+        self.worktree_excludes = list(worktree_excludes or [])
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.history = history or History(self.runs_dir / "history.jsonl")
         # Feedback logs (rsi/feedback.py). human_feedback.jsonl is what a
@@ -109,23 +129,106 @@ class Controller:
         data = json.loads(self.tasks_file.read_text())
         return data.get("tasks", []) if isinstance(data, dict) else data
 
-    def pick_next_task(self) -> dict | None:
+    def _resolve_delta(self, allow_calibrate: bool = False
+                       ) -> tuple[float, str]:
+        """The noise band for this round, and where it came from.
+
+        Priority: explicit config delta > runs/<domain>/calibration.json
+        (written by `rsi.py calibrate`) > auto-calibration from recorded
+        baseline evaluations (only when allow_calibrate, i.e. inside a
+        round after a baseline has just been recorded) > 0.02 fallback.
+        The fallback is the old pilot placeholder, used only so a round
+        never crashes on an unmeasured delta; its source is reported in
+        the round summary and status so it is never mistaken for a
+        measurement.
+        """
+        if self.cfg.delta is not None:
+            return float(self.cfg.delta), "config"
+        cal = read_calibration(self.runs_dir)
+        if cal is not None:
+            return cal, "calibration.json"
+        if allow_calibrate:
+            try:
+                c, _ = auto_calibrate(self.runs_dir, z=self.cfg.delta_z)
+                return float(c["delta"]), "auto-calibrated"
+            except ValueError:
+                pass
+        return 0.02, "fallback-0.02-unmeasured"
+
+    def _stall_state(self, delta: float | None = None) -> dict:
+        """Stall / exploration / prune snapshot for the round about to
+        start (RRSI loop.py step 2-3: sigma_t, T_t, U_t, E_t, B_t).
+
+        The trajectory is the incumbent score after each completed round
+        (history.trajectory()); the current incumbent (frontier score, or
+        the last trajectory point) is appended as index t, so stall_flag
+        compares "now" with w rounds ago, exactly as RRSI's
+        ``stall_flag(traj, t, cfg.w, delta)``. With fewer than w completed
+        rounds stall is 0 by construction.
+        """
+        if delta is None:
+            delta, _ = self._resolve_delta(allow_calibrate=False)
+        traj = self.history.trajectory()
+        now = self.frontier().get("score")
+        if now is None:
+            now = traj[-1] if traj else 0.0
+        extended = traj + [float(now)]
+        t = len(extended) - 1
+        stall = stall_flag(extended, t, self.cfg.w, delta)
+        tried = self.history.tried()
+        return {"trajectory": extended, "t": t, "stall": stall,
+                "tried": sorted(tried),
+                "exploration": exploration(t, stall, tried,
+                                           self.cfg.m_draft),
+                "prune_set": self.history.prune_set(t, self.cfg.n_prune)}
+
+    def _eligible_tasks(self, apply_stall: bool) -> list[dict]:
+        """Tasks still open, in file order. A task is open when it was
+        never attempted, or its latest verdict is NEEDS_HUMAN with a
+        human resolution recorded for that round (see pick_next_task).
+        When ``apply_stall`` and the run is stalled, tasks whose declared
+        component is stuck (same component failed >= 2 times in a row)
+        are held back -- they are still open, just not picked now."""
         tried = self.history.attempted_tasks()
+        stuck = set()
+        if apply_stall:
+            state = self._stall_state()
+            if state["stall"]:
+                stuck = self.history.stuck_components()
+        out = []
         for t in self.tasks():
             tid = t.get("task_id")
-            if tid not in tried:
-                return t
-            # A NEEDS_HUMAN task is still open: it becomes retryable once a
-            # human has recorded a resolution for that round's candidate
-            # (e.g. "update-test-expectation: ..."). Without a resolution
-            # the loop must not spin on the same task.
-            if self.history.latest_verdict(tid) == "NEEDS_HUMAN":
-                rec = self.history.latest_record(tid)
-                if rec and self.feedback_log.has_resolution(
-                        rec.get("candidate_id", ""),
-                        after_round=rec.get("round")):
-                    return t
-        return None
+            if tid in tried:
+                # A NEEDS_HUMAN task is still open: it becomes retryable
+                # once a human has recorded a resolution for that round's
+                # candidate (e.g. "update-test-expectation: ..."). Without
+                # a resolution the loop must not spin on the same task.
+                if self.history.latest_verdict(tid) == "NEEDS_HUMAN":
+                    rec = self.history.latest_record(tid)
+                    if not (rec and self.feedback_log.has_resolution(
+                            rec.get("candidate_id", ""),
+                            after_round=rec.get("round"))):
+                        continue
+                else:
+                    continue
+            if stuck and t.get("component") in stuck:
+                continue
+            out.append(t)
+        return out
+
+    def pick_next_task(self) -> dict | None:
+        """Next open task, skipping stuck-component tasks while stalled.
+
+        When the run is stalled, tasks on a stuck component (same label
+        failed >= 2 times in a row) are pushed back and the next task on
+        a different component is picked instead. When every open task is
+        on a stuck component this returns None -- it never invents a
+        task. (run() then reports STALLED rather than DONE, so the
+        difference between "nothing left" and "everything left is stuck"
+        stays visible.)
+        """
+        tasks = self._eligible_tasks(apply_stall=True)
+        return tasks[0] if tasks else None
 
     def status(self) -> dict:
         needs_human = []
@@ -137,12 +240,20 @@ class Controller:
                         rec.get("candidate_id", ""),
                         after_round=rec.get("round")):
                     needs_human.append(tid)
+        state = self._stall_state()
+        delta, delta_source = self._resolve_delta(allow_calibrate=False)
         return {"frontier": self.frontier(),
                 "history": self.history.render(20),
                 "stop_requested": self.stop_requested(),
+                "delta": delta,
+                "delta_source": delta_source,
                 "needs_human": needs_human,
                 "feedback": {"human": len(self.feedback_log.records()),
-                             "telemetry": len(self.telemetry_log.records())}}
+                             "telemetry": len(self.telemetry_log.records())},
+                "component_summary": self.history.component_summary(),
+                "stall": state["stall"],
+                "untried_components": state["exploration"]["untried"],
+                "prune_set": state["prune_set"]}
 
     def _verifier_owned_markers(self, task: dict) -> tuple[str, ...]:
         """File names the verifier owns for this task (repro + held-out).
@@ -187,7 +298,8 @@ class Controller:
         try:
             reward = run_verifier(
                 judge_wt, task, self.runs_dir / f"evidence-{task_id}-delayed",
-                heldout_base=self.tasks_file.parent.parent)
+                heldout_base=self.tasks_file.parent.parent,
+                k=max(1, int(task.get("k", self.cfg.k))))
         finally:
             wt.remove_worktree(self.repo, judge_wt, f"rsi/{task_id}-delayed")
         label = "correct" if reward.passed else "introduced_bug"
@@ -210,6 +322,43 @@ class Controller:
         base_commit = self.baseline_commit()
         summary: dict = {"round": round_no, "task_id": task_id,
                          "baseline_commit": base_commit}
+        # Stall / exploration / prune for this round (RRSI loop.py 2-3).
+        # The exploration text goes to the Fixer with the brief (see
+        # below); the compact stall/prune note goes into this round's
+        # ledger detail, and the full text when stalled (render_brief in
+        # fixer.py has no exploration slot and fixer.py is not this
+        # component's file to change, so the ledger is the durable copy).
+        # k: the task's own "k" wins, else the run config's k (default 1);
+        # only checks the task names in flaky_checks run k times.
+        k_eff = max(1, int(task.get("k", self.cfg.k)))
+        summary["k"] = k_eff
+        # Provisional delta for the stall snapshot: config, calibration
+        # file, or the 0.02 fallback. It is re-resolved after BASELINE
+        # (fresh baseline evaluation recorded), before judge().
+        delta, delta_source = self._resolve_delta(allow_calibrate=False)
+        summary["delta"] = delta
+        summary["delta_source"] = delta_source
+        state = self._stall_state(delta=delta)
+        summary["stall"] = state["stall"]
+        summary["exploration"] = state["exploration"]["text"]
+        summary["untried_components"] = state["exploration"]["untried"]
+        summary["prune_set"] = state["prune_set"]
+        _note = ""
+        if state["stall"] or state["prune_set"]:
+            _note = f" | stall={state['stall']}"
+            if state["prune_set"]:
+                _note += (" prune=" + ",".join(
+                    p["component"] for p in state["prune_set"]))
+            if state["stall"]:
+                _note += " exploration: " + state["exploration"]["text"]
+
+        def _detail(base: str) -> str:
+            return base + _note if _note else base
+
+        # Component label: the task's declared label until a diff exists,
+        # then the label the diff evidences (components.normalize --
+        # a declared label without diff evidence is re-attributed).
+        comp = task.get("component")
 
         # BASELINE: does the bug reproduce on a clean tree? Runs all tiers
         # (fail_fast=False) to capture the full per-test map: tier B's P2P
@@ -221,11 +370,25 @@ class Controller:
         try:
             base_reward = run_verifier(
                 judge_base, task, self.runs_dir / f"evidence-{task_id}-base",
-                heldout_base=self.tasks_file.parent.parent, fail_fast=False)
+                heldout_base=self.tasks_file.parent.parent, fail_fast=False,
+                k=k_eff)
         finally:
             wt.remove_worktree(self.repo, judge_base, f"rsi/{task_id}-base")
         summary["baseline_score"] = base_reward.score
         summary["baseline_passed"] = base_reward.passed
+        # Persist the baseline measurement: the reward file is what the
+        # deterministic analyzer reads for flaky-test detection (the
+        # ledger only keeps tier summaries), and the recorded baseline
+        # evaluation is what `calibrate` re-estimates delta from.
+        base_reward.save(self.runs_dir / f"reward-{task_id}-base.json")
+        base_ev = sel.eval_from_reward(task_id, base_reward, "base",
+                                       k=k_eff)
+        record_baseline_eval(self.runs_dir, base_ev, task_id)
+        # Fresh baseline data may now calibrate delta: re-resolve before
+        # judge() so an unmeasured delta does not crash the round.
+        delta, delta_source = self._resolve_delta(allow_calibrate=True)
+        summary["delta"] = delta
+        summary["delta_source"] = delta_source
         if base_reward.passed:
             self.history.append_candidate(
                 round_no, task_id, f"{task_id}-base", "base", None,
@@ -233,7 +396,8 @@ class Controller:
                 {"A": base_reward.tiers.get("A", {})}, "SKIPPED",
                 base_commit, base_reward.score, None,
                 round(time.time() - t0, 1), fixer=self.fixer.name,
-                detail="baseline already passes; nothing to fix")
+                detail=_detail("baseline already passes; nothing to fix"),
+                components=[comp] if comp else [])
             summary["verdict"] = "SKIPPED"
             summary["detail"] = "bug does not reproduce on baseline"
             return summary
@@ -246,6 +410,18 @@ class Controller:
         fixer_wt = self.runs_dir / f"fixer-{task_id}"
         wt.create_worktree(self.repo, fixer_wt, f"rsi/{task_id}-fixer",
                            start_point=base_commit)
+        # Worktree excludes (self domain: the task material). The Fixer
+        # must not be able to read its own exam: the excluded paths are
+        # removed from its worktree AND from the diff taken afterwards
+        # (diff_of_worktree's exclude pathspec), so neither reading nor
+        # re-creating them can reach the Judge. The task itself still
+        # reaches the Fixer through the brief, never through these files.
+        for rel in self.worktree_excludes:
+            target = fixer_wt / rel
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            elif target.exists():
+                target.unlink()
         # No node_modules here in the pilot: the manual fixer runs no
         # commands. A real fixer that self-checks with tsc/vitest must
         # provision them (wt.provision_node_modules) when it is wired.
@@ -255,6 +431,17 @@ class Controller:
             heldout_markers=self._verifier_owned_markers(task))
         task_for_fixer["heldout_markers"] = list(
             self._verifier_owned_markers(task))
+        # Stall redirection, carried with the brief: the exploration text
+        # (and the stall flag + prune set) ride on the task dict -- the
+        # fixer interface (fix(task, worktree, budget)) is unchanged, and
+        # render_brief in fixer.py renders only description / repro /
+        # feedback, so the dict is the carrier until its owner adds a
+        # slot. The same text is also recorded in this round's ledger
+        # detail (see _detail) and in the round summary.
+        task_for_fixer["exploration"] = state["exploration"]["text"]
+        task_for_fixer["stall_flag"] = state["stall"]
+        task_for_fixer["prune_set"] = [p["component"]
+                                       for p in state["prune_set"]]
         try:
             result: FixResult = self.fixer.fix(
                 task_for_fixer, fixer_wt,
@@ -267,34 +454,46 @@ class Controller:
                 round_no, task_id, f"{task_id}-c1", "A", None,
                 task.get("hypothesis"), None, {}, "STUCK", base_commit, None,
                 None, round(time.time() - t0, 1), fixer=self.fixer.name,
-                detail=f"fixer raised: {e}")
+                detail=_detail(f"fixer raised: {e}"),
+                components=[comp] if comp else [])
             summary["verdict"] = "STUCK"
             summary["detail"] = f"fixer raised: {e}"
             return summary
-        diff = wt.diff_of_worktree(fixer_wt, base_commit)
+        diff = wt.diff_of_worktree(fixer_wt, base_commit,
+                                   exclude=self.worktree_excludes or None)
         wt.remove_worktree(self.repo, fixer_wt, f"rsi/{task_id}-fixer")
+        # From here on the label is what the diff evidences, not what the
+        # task declared (components.normalize: an unevidenced declaration
+        # is re-attributed from the diff's file/content signals).
+        comp = normalize_component(task.get("component"), diff)
         summary["submissions"] = result.submissions
         if not diff.strip():
             self.history.append_candidate(
                 round_no, task_id, f"{task_id}-c1", "A", None,
                 task.get("hypothesis"), diff, {}, "STUCK", base_commit, None,
                 result.cost_tokens, result.cost_seconds, fixer=self.fixer.name,
-                detail="fixer produced an empty diff")
+                detail=_detail("fixer produced an empty diff"),
+                components=[comp])
             summary["verdict"] = "STUCK"
             summary["detail"] = "fixer produced an empty diff"
             return summary
 
-        # VERIFY: critic first, then a clean Judge worktree.
+        # VERIFY: critic first, then a clean Judge worktree. The domain
+        # selects the domain-scoped blacklist (domain="self" turns on the
+        # meta-guardrail) and the domain's own critic patterns apply on
+        # top of the generic protected list (RRSI: domain patterns).
         review = critic_mod.review(
-            diff, domain_patterns=None,
-            task_ids=[t.get("task_id") for t in self.tasks()])
+            diff, domain_patterns=self.domain_patterns or None,
+            task_ids=[t.get("task_id") for t in self.tasks()],
+            domain=self.domain)
         if review["verdict"] == "reject":
             verdict = "GAMING-DETECTED" if review["gaming"] else "REJECT"
             self.history.append_candidate(
                 round_no, task_id, f"{task_id}-c1", "A", None,
                 task.get("hypothesis"), diff, {}, verdict, base_commit, None,
                 result.cost_tokens, result.cost_seconds, fixer=self.fixer.name,
-                detail="; ".join(review["reasons"]))
+                detail=_detail("; ".join(review["reasons"])),
+                components=[comp])
             summary["verdict"] = verdict
             summary["detail"] = "; ".join(review["reasons"])
             return summary
@@ -312,17 +511,19 @@ class Controller:
             wt.apply_diff(judge_wt, diff)
             reward: Reward = run_verifier(
                 judge_wt, task, self.runs_dir / f"evidence-{task_id}",
-                heldout_base=self.tasks_file.parent.parent)
+                heldout_base=self.tasks_file.parent.parent, k=k_eff)
         except Exception as e:  # diff does not apply cleanly: STUCK
             wt.remove_worktree(self.repo, judge_wt, f"rsi/{task_id}")
             self.history.append_candidate(
                 round_no, task_id, f"{task_id}-c1", "A", task.get("component"),
                 task.get("hypothesis"), diff, {}, "STUCK", base_commit, None,
                 result.cost_tokens, result.cost_seconds,
-                fixer=self.fixer.name, detail=f"judge setup failed: {e}")
+                fixer=self.fixer.name, detail=_detail(f"judge setup failed: {e}"),
+                components=[comp])
             summary["verdict"] = "STUCK"
             summary["detail"] = f"judge setup failed: {e}"
             return summary
+        reward.save(self.runs_dir / f"reward-{task_id}-c1.json")
         summary["score"] = reward.score
         summary["tiers"] = {k: {"passed": v["passed"], "status": v["status"]}
                             for k, v in reward.tiers.items()}
@@ -413,14 +614,16 @@ class Controller:
                                             ensure_ascii=False))
             self.history.append_candidate(
                 round_no, task_id, f"{task_id}-c1", "A",
-                task.get("component"), task.get("hypothesis"), diff,
+                comp, task.get("hypothesis"), diff,
                 {k: {"passed": v["passed"], "status": v["status"]}
                  for k, v in reward.tiers.items()},
                 "NEEDS_HUMAN", base_commit, reward.score,
                 result.cost_tokens,
                 result.cost_seconds + reward.duration_s,
                 fixer=self.fixer.name,
-                detail=classification["reason"] + f" card: {card_path.name}")
+                detail=_detail(classification["reason"]
+                               + f" card: {card_path.name}"),
+                components=[comp])
             summary["verdict"] = "NEEDS_HUMAN"
             summary["detail"] = classification["reason"]
             summary["decision"] = vote
@@ -431,12 +634,13 @@ class Controller:
             summary["duration_s"] = round(time.time() - t0, 1)
             return summary
 
-        base_ev = sel.eval_from_reward(task_id, base_reward, "base")
+        # base_ev was computed right after BASELINE (and recorded for
+        # calibration); only the candidate side is evaluated here.
         cand_ev = sel.eval_from_reward(task_id, reward, "candidate",
-                                       p2p_clean=p2p_clean)
+                                       p2p_clean=p2p_clean, k=k_eff)
         s_star = max(self.frontier().get("score") or 0.0, base_ev.S)
         cand = sel.Candidate(variant="A",
-                             edits=[{"component": task.get("component"),
+                             edits=[{"component": comp,
                                      "hypothesis": task.get("hypothesis")}],
                              ev=cand_ev)
         incumbent_counts = {}
@@ -445,7 +649,10 @@ class Controller:
             if c:
                 incumbent_counts[c] = incumbent_counts.get(c, 0) + 1
         guards = self.guard_fn(diff) if self.guard_fn else []
-        decision = sel.judge(cand, base_ev, s_star, self.cfg.delta,
+        # delta is the value resolved after BASELINE (config, measured
+        # calibration, auto-calibrated, or the 0.02 fallback) -- never
+        # None here, so judge() cannot crash on an unmeasured delta.
+        decision = sel.judge(cand, base_ev, s_star, delta,
                              self.cfg, incumbent_counts, guards)
         summary["decision"] = decision.to_json()
         if decision.admissible:
@@ -464,14 +671,15 @@ class Controller:
             wt.remove_worktree(self.repo, judge_wt, f"rsi/{task_id}")
             verdict = "REJECT"
         self.history.append_candidate(
-            round_no, task_id, f"{task_id}-c1", "A", task.get("component"),
+            round_no, task_id, f"{task_id}-c1", "A", comp,
             task.get("hypothesis"), diff,
             {k: {"passed": v["passed"], "status": v["status"]}
              for k, v in reward.tiers.items()},
             verdict, self.frontier().get("baseline_commit"), reward.score,
             result.cost_tokens,
             result.cost_seconds + reward.duration_s,
-            fixer=self.fixer.name, detail=decision.reason)
+            fixer=self.fixer.name, detail=_detail(decision.reason),
+            components=[comp])
         summary["verdict"] = verdict
         summary["detail"] = decision.reason
         summary["duration_s"] = round(time.time() - t0, 1)
@@ -488,8 +696,19 @@ class Controller:
                 break
             task = self.pick_next_task()
             if task is None:
-                summaries.append({"round": t, "verdict": "DONE",
-                                  "detail": "no more tasks"})
+                if self._eligible_tasks(apply_stall=False):
+                    # Open tasks exist, but every one of them is on a
+                    # stuck component while stalled: the loop must not
+                    # report DONE (nothing left) and must not invent a
+                    # task. STALLED says "wait for a human to unstick a
+                    # component or add a task on another one".
+                    summaries.append({"round": t, "verdict": "STALLED",
+                                      "detail": ("stalled: all remaining "
+                                                 "tasks are on stuck "
+                                                 "components")})
+                else:
+                    summaries.append({"round": t, "verdict": "DONE",
+                                      "detail": "no more tasks"})
                 break
             summaries.append(self.run_task(task, t))
         return summaries

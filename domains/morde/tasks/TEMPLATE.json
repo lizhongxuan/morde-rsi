@@ -8,6 +8,8 @@
   "hypothesis": "为什么这个修法应该有效（一句话）。",
   "behavior_change": "修完后用户能观察到的行为变化（一句话，不写代码改动；审批卡上就显示这句）。",
   "behavior_tests": ["断言上述行为的测试文件/测试名，如 src/routes/Projects.test.tsx。单点 P2P 失败时，若未过的测试正在此列，裁决走 NEEDS_HUMAN 而不是自动 REJECT。"],
+  "k": 1,
+  "flaky_checks": ["可选：声明抖动的检查名，与 reward.json 里的检查名一致，如 \"B-0\"。只有列出的检查跑 k 次取聚合分（缺失计 0、分母不变），其余检查永远跑 1 次；k=1 时与原来完全一致。见 docs/rrsi-mapping.md 的 k-trial 一节。"],
   "tiers": {
     "A": {
       "commands": [

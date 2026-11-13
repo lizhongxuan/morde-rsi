@@ -1,0 +1,1 @@
+{"_doc":"Held-out set: tasks the loop is measured on but never evolves on. EMPTY in the pilot (the pilot measures on the evolve set's tier C). Held-out test FILES live in tasks/heldout/<task-id>/ and are injected by the verifier; the Fixer must never read this directory (see domains/self/SKILL.md).","tasks":[]}

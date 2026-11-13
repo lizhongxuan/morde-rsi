@@ -41,3 +41,21 @@ def test_provision_node_modules_skips_when_present(tmp_path):
     wt_path = tmp_path / "wt" / "web" / "portal"
     (wt_path / "node_modules").mkdir(parents=True)
     assert wt.provision_node_modules(tmp_path / "wt") is False
+
+
+def test_diff_excludes_paths(fixture_repo, tmp_path):
+    # Self-domain defence in depth: paths removed from the Fixer worktree
+    # must not leak into its diff, while other changes still do.
+    repo = fixture_repo
+    path = tmp_path / "wt3"
+    wt.create_worktree(repo, path, "rsi/test-3")
+    try:
+        (path / "secret.txt").write_text("do not read me\n")
+        wt.apply_diff(path, FIX_DIFF)
+        excluded = wt.diff_of_worktree(path, "HEAD", exclude=["secret.txt"])
+        assert "secret.txt" not in excluded
+        assert "return a + b" in excluded
+        included = wt.diff_of_worktree(path, "HEAD")
+        assert "secret.txt" in included
+    finally:
+        wt.remove_worktree(repo, path, "rsi/test-3")

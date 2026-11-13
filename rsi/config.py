@@ -20,7 +20,13 @@ class RSIConfig:
     b_max: int = 2
     w: int = 3
     m_draft: int = 1
-    delta: float = 0.02
+    # Noise band. None (JSON null) means "unmeasured": the CLI then looks
+    # for runs/<domain>/calibration.json (written by `rsi.py calibrate`)
+    # and, after a baseline run, re-estimates delta from repeated baseline
+    # evaluations instead of using a number here. The 0.02 default applies
+    # only when the key is absent (the pilot placeholder; kept so existing
+    # tests and manual runs that load no config file keep working).
+    delta: float | None = 0.02
     delta_z: float = 2.0
     beta0: float = 0.10
     beta1: float = 44.5

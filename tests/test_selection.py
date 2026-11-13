@@ -100,3 +100,69 @@ def test_eval_from_reward_falls_back_to_commands():
     }}
     ev = eval_from_reward("T", reward, "candidate")
     assert ev.S == 1.0 and ev.f2p_pass and ev.p2p_clean
+
+# ------------------------------------------------------------- k-trial -----
+
+def test_eval_from_reward_k2_trials_mean():
+    """A check that ran 2 trials (1 fail, 1 pass) contributes two rewards,
+    so S is 0.5 -- the trial mean, not the strict check flag."""
+    from rsi.selection import eval_from_reward
+    reward = {"tiers": {
+        "A": {"passed": False, "status": "run", "checks": [
+            {"passed": False, "tests": {},
+             "trials": [{"passed": False, "returncode": 1, "missing": False},
+                        {"passed": True, "returncode": 0, "missing": False}]}]},
+    }}
+    ev = eval_from_reward("T", reward, "job", k=2)
+    assert ev.S == 0.5
+    assert ev.k == 2 and ev.n_expected == 2
+    assert ev.missing == 0
+
+
+def test_eval_from_reward_missing_trial_counts_zero():
+    """A timed-out trial (returncode None, missing=True) contributes 0
+    with the denominator kept: rewards [0, 1] over 2 trials -> S 0.5,
+    missing 1, n_expected 2 (not 1)."""
+    from rsi.selection import eval_from_reward
+    reward = {"tiers": {
+        "A": {"passed": False, "status": "run", "checks": [
+            {"passed": False, "tests": {},
+             "trials": [{"passed": False, "returncode": None, "missing": True},
+                        {"passed": True, "returncode": 0, "missing": False}]}]},
+    }}
+    ev = eval_from_reward("T", reward, "job", k=2)
+    assert ev.S == 0.5
+    assert ev.missing == 1
+    assert ev.n_expected == 2
+
+
+def test_eval_from_reward_k1_unchanged():
+    """No trials recorded (old reward.json shape) and k=1: exactly the
+    old behaviour -- one reward per check, k recorded as 1."""
+    from rsi.selection import eval_from_reward
+    reward = {"tiers": {
+        "A": {"passed": True, "status": "run", "checks": [
+            {"passed": True, "tests": {}}]},
+        "B": {"passed": True, "status": "run", "checks": [
+            {"passed": False, "tests": {}}]},
+    }}
+    ev = eval_from_reward("T", reward, "job")
+    # f2p (A, w2): 1.0; p2p (B, w1): 0.0 -> S = 2/3 (exact float division)
+    assert ev.S == 2 / 3
+    assert ev.k == 1 and ev.missing == 0
+
+
+def test_eval_from_reward_per_test_scored_still_counts_missing():
+    """On the per-test path (go-test-json) the per-test rewards dominate,
+    but a missing trial is still counted: it ran and failed, even though
+    it produced no test results."""
+    from rsi.selection import eval_from_reward
+    reward = {"tiers": {
+        "B": {"passed": True, "status": "run", "checks": [
+            {"passed": True, "tests": {"TestKeep": True, "TestEnv": False},
+             "trials": [{"passed": False, "returncode": None, "missing": True},
+                        {"passed": True, "returncode": 1, "missing": False}]}]},
+    }}
+    ev = eval_from_reward("T", reward, "job", k=2)
+    assert ev.S == 0.5  # per-test: 1 of 2 tests passed
+    assert ev.missing == 1

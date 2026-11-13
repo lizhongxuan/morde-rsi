@@ -46,6 +46,26 @@ GENERIC_CONTENT_PATTERNS = [
      "credential in diff"),
 ]
 
+# Self-domain (meta) protected paths. ONLY enforced when the caller says
+# domain == "self" -- never for the morde domain (see review()/precheck()).
+# The self loop grades its own repo, so "grading its own exam" has a wider
+# surface than the morde loop: the morde Fixer works in the Morde repo and
+# can never reach rsi.py / tests / runs / domains/self at all, while the
+# self Fixer works in THIS repo and all of those paths are in its worktree.
+# A hit here is the same GAMING-DETECTED as a hit on the generic list:
+# the candidate was caught rewriting the judge, the threshold, the task,
+# or the ledger, and only a human PR may touch these paths.
+SELF_PROTECTED_PATH_PATTERNS = [
+    (r"(^|/)rsi\.py$", "self-loop CLI entry touched"),
+    (r"(^|/)tests/", "test directory touched (self domain)"),
+    (r"(^|/)runs/", "runs ledger/evidence directory touched (self domain)"),
+    (r"history\.jsonl$", "evidence ledger touched (self domain)"),
+    (r"(^|/)domains/self/rrsi\.json$", "self-loop thresholds touched"),
+    (r"(^|/)domains/self/SKILL\.md$", "self proposer constitution touched"),
+    (r"(^|/)domains/self/adapter\.py$", "self domain adapter touched"),
+    (r"(^|/)domains/self/tasks/", "self task material touched"),
+]
+
 _DIFF_GIT_RE = re.compile(r"^diff --git a/(.+?) b/(.+?)$", re.M)
 _PLUS_RE = re.compile(r"^\+\+\+ b/(.+?)$", re.M)
 
@@ -63,11 +83,23 @@ def extract_paths(diff: str) -> list[str]:
     return paths
 
 
-def precheck(diff: str, domain_patterns: list | None = None) -> list[dict]:
-    """Deterministic checks. Returns a list of {kind, reason, where} hits."""
+def precheck(diff: str, domain_patterns: list | None = None,
+             domain: str | None = None) -> list[dict]:
+    """Deterministic checks. Returns a list of {kind, reason, where} hits.
+
+    `domain` selects the domain-scoped blacklist: "self" adds
+    SELF_PROTECTED_PATH_PATTERNS (the meta-guardrail: the self loop must
+    never rewrite its own judge/threshold/tasks/ledger). Any other value
+    (including None, the morde domain) applies only the generic list, so
+    morde behaviour is unchanged.
+    """
     hits: list[dict] = []
+    patterns = list(PROTECTED_PATH_PATTERNS)
+    if domain == "self":
+        patterns += SELF_PROTECTED_PATH_PATTERNS
+    patterns += list(domain_patterns or [])
     for path in extract_paths(diff):
-        for pat, why in PROTECTED_PATH_PATTERNS + list(domain_patterns or []):
+        for pat, why in patterns:
             if re.search(pat, path):
                 hits.append({"kind": "protected-path", "reason": why,
                              "where": path})
@@ -78,16 +110,20 @@ def precheck(diff: str, domain_patterns: list | None = None) -> list[dict]:
 
 
 def review(diff: str, domain_patterns: list | None = None,
-           task_ids: list[str] | None = None) -> dict:
+           task_ids: list[str] | None = None,
+           domain: str | None = None) -> dict:
     """Verdict for one candidate diff, before evaluation.
 
     Returns {"verdict": "accept" | "reject", "gaming": bool,
              "reasons": [...], "risk_notes": [...]}.
+
+    `domain="self"` turns on the self-loop blacklist (see
+    SELF_PROTECTED_PATH_PATTERNS); any other domain leaves it off.
     """
     if not (diff or "").strip():
         return {"verdict": "reject", "gaming": False,
                 "reasons": ["empty diff"], "risk_notes": []}
-    hits = precheck(diff, domain_patterns)
+    hits = precheck(diff, domain_patterns, domain=domain)
     # Task-id hard-coding: a fix must not branch on the identity of the
     # held-out task it is being measured on.
     for tid in task_ids or []:

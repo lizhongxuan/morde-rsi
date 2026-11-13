@@ -52,14 +52,22 @@ def create_worktree(repo: Path, path: Path, branch: str,
     return Path(path)
 
 
-def diff_of_worktree(worktree: Path, base: str = "HEAD") -> str:
+def diff_of_worktree(worktree: Path, base: str = "HEAD",
+                     exclude: list[str] | None = None) -> str:
     """Uncommitted + untracked (tracked only) diff of a worktree vs base.
 
     Untracked new files are included via `git add -N` (intent-to-add) so the
-    diff is complete without staging anything.
+    diff is complete without staging anything. `exclude` is a list of
+    worktree-relative paths removed from the diff (git pathspec `:!path`):
+    used by the self domain so the Fixer's deletions/creations under the
+    task-material directory (which is removed from its worktree before it
+    starts, so it cannot read the exam) never leak into the candidate diff.
     """
     _git(worktree, "add", "-N", ".")
-    r = _git(worktree, "diff", base, check=False)
+    args = ["diff", base, "--", "."]
+    for path in exclude or []:
+        args.append(f":!{path}")
+    r = _git(worktree, *args, check=False)
     return r.stdout
 
 

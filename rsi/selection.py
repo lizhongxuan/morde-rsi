@@ -122,13 +122,23 @@ def test_map(reward, tier_name: str) -> dict:
 
 def eval_from_reward(task_id: str, reward, job: str,
                      f2p_pass: bool | None = None,
-                     p2p_clean: bool | None = None) -> EvalResult:
+                     p2p_clean: bool | None = None, k: int = 1) -> EvalResult:
     """Map a verifier Reward (or its dict form) to RRSI's EvalResult.
 
     S = weighted pass rate over the task's checks. Per tier, when the checks
     carry per-test results (go-test-json), the tier is scored per test;
     otherwise it is scored per command. Weights: tier A (repro /
     fail-to-pass) 2, tier B (regression) 1, tier C (held-out) 2.
+
+    k-trial (RRSI evaluate.py aggregation, ported): a check that ran k
+    trials (task field `flaky_checks`, see rsi/verifier.py) contributes one
+    reward per trial, so a check passing 1 of 2 trials scores 0.5. A trial
+    that never ran (timeout / missing binary, check dict "trials" entry
+    with missing=True) contributes 0 with the denominator kept -- the
+    missing count is recorded on the TaskResult, never an absent slot.
+    When a tier is scored per test, the per-test rewards still dominate;
+    missing trials are counted all the same. `k` is passed through to
+    aggregate (n_expected = groups * k); k=1 is exactly the old behaviour.
 
     F2P passes iff tier A passed; P2P is clean iff tier B passed. The caller
     (controller) may override both with per-test comparisons against the
@@ -144,20 +154,30 @@ def eval_from_reward(task_id: str, reward, job: str,
         test_results: dict[str, bool] = {}
         for c in checks:
             test_results.update(c.get("tests", {}) or {})
+        # Missing trials count even on the per-test path: a trial that
+        # timed out produced no test results, but it still ran (and failed).
+        missing = sum(1 for c in checks for t in (c.get("trials") or [])
+                      if t.get("missing"))
         if test_results:
             rewards = [1.0 if v else 0.0 for v in test_results.values()]
-            weights = [GROUP_WEIGHTS.get(name, 1.0)] * len(rewards)
         else:
-            rewards = [1.0 if c["passed"] else 0.0 for c in checks]
-            weights = [GROUP_WEIGHTS.get(name, 1.0)] * len(checks)
+            rewards = []
+            for c in checks:
+                trials = c.get("trials") or []
+                if trials:
+                    rewards += [1.0 if t.get("passed") else 0.0
+                                for t in trials]
+                else:
+                    rewards.append(1.0 if c["passed"] else 0.0)
+        weights = [GROUP_WEIGHTS.get(name, 1.0)] * len(rewards)
         per[GROUP_NAMES.get(name, name)] = TaskResult(
             rewards=rewards, weights=weights,
-            tokens=[None] * len(rewards))
+            tokens=[None] * len(rewards), missing=missing)
     if f2p_pass is None:
         f2p_pass = tiers.get("A", {}).get("passed", False)
     if p2p_clean is None:
         p2p_clean = tiers.get("B", {}).get("passed", True)
-    return aggregate(job, 1, per, f2p_pass=bool(f2p_pass),
+    return aggregate(job, k, per, f2p_pass=bool(f2p_pass),
                      p2p_clean=bool(p2p_clean))
 
 

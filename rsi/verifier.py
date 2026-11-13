@@ -20,6 +20,18 @@ is 0 iff every executed tier passed.
 A check is one command. A missing command (binary not found) fails the check
 with the stderr recorded; it is never silently skipped, so a candidate cannot
 look better by destroying its own verification.
+
+k-trial (RRSI evaluate.py aggregation): a task may name flaky checks in
+`flaky_checks` (check names as in reward.json, e.g. "B-0" = tier B command 0)
+and set `k` (or the caller passes k). Only the named checks run k times;
+every other check runs once, exactly as before. Each trial is recorded in
+the check's `trials` list (passed / returncode / missing / output_path) and
+counts as one reward in selection.eval_from_reward, so a check passing 1 of
+2 trials scores 0.5. A trial that times out or whose binary is missing has
+returncode None and missing=True: it contributes 0 with the denominator
+kept, never an absent slot. The merged `passed` stays strict (all trials
+must pass) so the F2P/P2P hard gates never loosen because a check is flaky.
+For go-test-json checks the per-test map merges with AND across trials.
 """
 from __future__ import annotations
 
@@ -40,6 +52,11 @@ class CheckResult:
     duration_s: float
     output_path: str | None = None
     tests: dict = field(default_factory=dict)  # test name -> passed (go-test-json)
+    # One entry per trial that ran this check (k=1: exactly one entry):
+    # {"passed": bool, "returncode": int | None, "missing": bool,
+    #  "output_path": str | None}. missing=True iff the trial never ran
+    # (timeout or binary not found, i.e. returncode is None).
+    trials: list = field(default_factory=list)
 
 
 @dataclass
@@ -143,13 +160,49 @@ def _run_one(worktree: Path, name: str, command, timeout_s: int,
             ok = rc == 0 and all(tests.values())
     else:
         ok = rc == 0
-    return CheckResult(name=name, command=argv, passed=ok, returncode=rc,
-                       duration_s=round(time.time() - t0, 1),
-                       output_path=str(out_path), tests=tests)
+    result = CheckResult(name=name, command=argv, passed=ok, returncode=rc,
+                         duration_s=round(time.time() - t0, 1),
+                         output_path=str(out_path), tests=tests)
+    # A single run is a single trial; _run_trials merges these per trial.
+    result.trials = [{"passed": ok, "returncode": rc, "missing": rc is None,
+                      "output_path": str(out_path)}]
+    return result
+
+
+def _run_trials(worktree: Path, name: str, command, timeout_s: int,
+                evidence_dir: Path, mode: str = "all-pass",
+                k: int = 1) -> CheckResult:
+    """Run one check k times and merge the trials into one CheckResult.
+
+    k=1 is exactly the old single run. For k>1 each trial gets its own
+    evidence log (<name>.t<j>.log); `output_path` points at trial 0's log.
+    The merged `passed` is strict (all trials must pass) and the per-test
+    map merges with AND, so k-trial never loosens a gate -- it only refines
+    the score, which selection.eval_from_reward reads from `trials`.
+    """
+    results = []
+    for j in range(k):
+        log_name = f"{name}.t{j}" if k > 1 else name
+        r = _run_one(worktree, log_name, command, timeout_s,
+                     evidence_dir, mode=mode)
+        r.name = name
+        results.append(r)
+    tests: dict[str, bool] = {}
+    for r in results:
+        for t, ok in r.tests.items():
+            tests[t] = tests.get(t, True) and ok
+    return CheckResult(name=name, command=results[0].command,
+                       passed=all(r.passed for r in results),
+                       returncode=results[-1].returncode,
+                       duration_s=round(sum(r.duration_s for r in results), 1),
+                       output_path=results[0].output_path,
+                       tests=tests,
+                       trials=[r.trials[0] for r in results])
 
 
 def _run_tier(worktree: Path, tier_name: str, tier_cfg: dict,
-              evidence_dir: Path) -> TierResult:
+              evidence_dir: Path, k: int = 1,
+              flaky_checks: frozenset | set = frozenset()) -> TierResult:
     t0 = time.time()
     timeout_s = int(tier_cfg.get("timeout_s", 600))
     mode = tier_cfg.get("mode", "all-pass")
@@ -157,8 +210,12 @@ def _run_tier(worktree: Path, tier_name: str, tier_cfg: dict,
     for i, cmd in enumerate(tier_cfg.get("commands", [])):
         # Pass dict commands through unchanged; copy plain argv lists.
         cmd = list(cmd) if isinstance(cmd, list) else cmd
-        checks.append(_run_one(worktree, f"{tier_name}-{i}", cmd,
-                               timeout_s, evidence_dir, mode=mode))
+        name = f"{tier_name}-{i}"
+        # Only checks named in the task's flaky_checks run k times; the
+        # rest run once even when k > 1.
+        n = k if name in flaky_checks else 1
+        checks.append(_run_trials(worktree, name, cmd, timeout_s,
+                                  evidence_dir, mode=mode, k=n))
     passed = all(c.passed for c in checks) and bool(checks)
     return TierResult(name=tier_name, passed=passed, status="run",
                       checks=checks, duration_s=round(time.time() - t0, 1))
@@ -196,7 +253,7 @@ def _remove_files(paths: list[Path]) -> None:
 
 def run_verifier(worktree: Path | str, task: dict,
                  evidence_dir: Path | str, heldout_base: Path | str | None = None,
-                 fail_fast: bool = True) -> Reward:
+                 fail_fast: bool = True, k: int | None = None) -> Reward:
     """Run tiers A/B/C for one task in one worktree. Returns a Reward.
 
     A relative tier-C held-out `src` is resolved against `heldout_base`
@@ -208,12 +265,22 @@ def run_verifier(worktree: Path | str, task: dict,
     The BASELINE run uses fail_fast=False: the baseline must capture the
     full per-test map (tier B's P2P set, tier C's held-out baseline) even
     though the bug reproduces in tier A.
+
+    `k` (default 1): trials for the checks the task names in
+    `flaky_checks` (check names as in reward.json, e.g. "B-0"). An explicit
+    `k` argument wins; otherwise the task JSON's own "k" is used. Only the
+    named checks run k times -- undeclared checks always run once, so the
+    pilot default k=1 changes nothing. The merged check `passed` stays
+    strict (all trials must pass); the per-trial scores live in each
+    check's `trials` list and are aggregated by selection.eval_from_reward.
     """
     worktree, evidence_dir = Path(worktree), Path(evidence_dir)
     evidence_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     tiers: dict[str, TierResult] = {}
     tier_cfgs = task.get("tiers", {})
+    k_eff = max(1, int(k if k is not None else task.get("k", 1)))
+    flaky = set(task.get("flaky_checks") or [])
 
     # Tier A: build + vet + targeted unit tests. Fail-fast (unless the
     # caller asked for the full baseline map). The repro test (if any) is
@@ -223,20 +290,23 @@ def run_verifier(worktree: Path | str, task: dict,
     a_injected = _inject_files(worktree, a_cfg.get("repro") or {},
                                heldout_base)
     try:
-        tiers["A"] = _run_tier(worktree, "A", a_cfg, evidence_dir)
+        tiers["A"] = _run_tier(worktree, "A", a_cfg, evidence_dir,
+                               k=k_eff, flaky_checks=flaky)
     finally:
         _remove_files(a_injected)
     if fail_fast and not tiers["A"].passed:
         for name in ("B", "C"):
             tiers[name] = TierResult(name=name, passed=False, status="skipped")
     else:
-        tiers["B"] = _run_tier(worktree, "B", tier_cfgs.get("B", {}), evidence_dir)
+        tiers["B"] = _run_tier(worktree, "B", tier_cfgs.get("B", {}),
+                               evidence_dir, k=k_eff, flaky_checks=flaky)
         # Tier C: inject held-out tests from OUTSIDE the worktree, run, delete.
         c_cfg = tier_cfgs.get("C", {})
         c_injected = _inject_files(worktree, c_cfg.get("heldout") or {},
                                    heldout_base)
         try:
-            tiers["C"] = _run_tier(worktree, "C", c_cfg, evidence_dir)
+            tiers["C"] = _run_tier(worktree, "C", c_cfg, evidence_dir,
+                                   k=k_eff, flaky_checks=flaky)
         finally:
             _remove_files(c_injected)
 

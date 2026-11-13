@@ -185,3 +185,128 @@ def test_tier_a_repro_passes_after_fix(tmp_path):
     assert reward.passed is True
     assert reward.score == 1.0
     assert not (repo / "test_calc.py").exists()
+
+# ------------------------------------------------------- k-trial (flaky) --
+
+def _counter_script(tmp_path, name, fail_first=1, sleep_first=False):
+    """A check that fails (or sleeps past the timeout) on its first
+    `fail_first` runs, then passes. State lives in a counter file next to
+    the script, so the check is flaky across repeated runs of the same
+    command: run 1 fails, run 2 passes."""
+    script = tmp_path / name
+    counter = tmp_path / (name + ".count")
+    lines = [
+        "import sys, time",
+        "from pathlib import Path",
+        f"counter = Path(r'{counter}')",
+        "n = int(counter.read_text()) if counter.exists() else 0",
+        "counter.write_text(str(n + 1))",
+    ]
+    if sleep_first:
+        lines += [f"if n < {fail_first}:", "    time.sleep(30)"]
+    else:
+        lines += [f"if n < {fail_first}:", "    sys.exit(1)"]
+    lines.append("sys.exit(0)")
+    script.write_text("\n".join(lines) + "\n")
+    return [sys.executable, str(script)]
+
+
+def _pass_cmd():
+    return [sys.executable, "-c", "import sys; sys.exit(0)"]
+
+
+def _flaky_task(tmp_path, fail_first=1, sleep_first=False, k=2):
+    """Tier A is the flaky check (named A-0); B and C always pass."""
+    return {"task_id": "FLAKY-001", "k": k, "flaky_checks": ["A-0"],
+            "tiers": {
+                "A": {"commands": [_counter_script(tmp_path, "flaky.py",
+                                                   fail_first, sleep_first)],
+                      "timeout_s": 1 if sleep_first else 30},
+                "B": {"commands": [_pass_cmd()], "timeout_s": 30},
+                "C": {"commands": [_pass_cmd()], "timeout_s": 30}}}
+
+
+def test_flaky_check_k2_aggregates_to_half(tmp_path):
+    """1st trial fails, 2nd passes -> the check scores 0.5, not 0 or 1.
+    The merged `passed` stays strict (all trials must pass), so tier A
+    still fails and B/C are skipped by fail-fast; the aggregate S over
+    the executed tier is 0.5 with no missing trials."""
+    from rsi.selection import eval_from_reward
+
+    task = _flaky_task(tmp_path)
+    reward = run_verifier(tmp_path, task, tmp_path / "evidence")
+    check = reward.tiers["A"]["checks"][0]
+    assert len(check["trials"]) == 2
+    assert [t["passed"] for t in check["trials"]] == [False, True]
+    assert [t["missing"] for t in check["trials"]] == [False, False]
+    assert check["passed"] is False  # strict: not all trials passed
+    assert reward.tiers["B"]["status"] == "skipped"
+    ev = eval_from_reward("FLAKY-001", reward, "job", k=2)
+    assert ev.S == 0.5
+    assert ev.missing == 0
+    assert ev.k == 2 and ev.n_expected == 2
+
+
+def test_flaky_check_k1_unchanged(tmp_path):
+    """Pilot default: the same flaky check with k=1 runs once, exactly as
+    before -- one trial, S 0.0, no behaviour change."""
+    from rsi.selection import eval_from_reward
+
+    task = _flaky_task(tmp_path, k=1)
+    reward = run_verifier(tmp_path, task, tmp_path / "evidence")
+    check = reward.tiers["A"]["checks"][0]
+    assert len(check["trials"]) == 1
+    assert check["trials"][0]["passed"] is False
+    assert check["passed"] is False
+    assert reward.score == 0.0
+    ev = eval_from_reward("FLAKY-001", reward, "job")
+    assert ev.S == 0.0 and ev.k == 1 and ev.missing == 0
+
+
+def test_nonflaky_checks_run_once_when_k2(tmp_path):
+    """Only checks named in flaky_checks run k times: with k=2 and A-0
+    flaky, tier A runs twice (both pass: fail_first=0) while B and C run
+    once each. The counters prove the run counts."""
+    from rsi.selection import eval_from_reward
+
+    task = _flaky_task(tmp_path, fail_first=0, k=2)
+    b_script = _counter_script(tmp_path, "b.py", fail_first=0)
+    task["tiers"]["B"]["commands"] = [b_script]
+    reward = run_verifier(tmp_path, task, tmp_path / "evidence")
+    assert (tmp_path / "flaky.py.count").read_text() == "2"
+    assert (tmp_path / "b.py.count").read_text() == "1"
+    assert len(reward.tiers["B"]["checks"][0]["trials"]) == 1
+    assert reward.passed is True and reward.score == 1.0
+    ev = eval_from_reward("FLAKY-001", reward, "job", k=2)
+    assert ev.S == 1.0 and ev.missing == 0
+
+
+def test_timeout_trial_counts_zero_not_absent(tmp_path):
+    """Trial 1 times out (missing), trial 2 passes: the missing trial
+    contributes 0 and the denominator stays 2, so S is 0.5 with
+    missing == 1 -- the trial is not dropped from the aggregate."""
+    from rsi.selection import eval_from_reward
+
+    task = _flaky_task(tmp_path, fail_first=1, sleep_first=True, k=2)
+    reward = run_verifier(tmp_path, task, tmp_path / "evidence")
+    check = reward.tiers["A"]["checks"][0]
+    assert [t["passed"] for t in check["trials"]] == [False, True]
+    assert [t["missing"] for t in check["trials"]] == [True, False]
+    assert check["trials"][0]["returncode"] is None  # TimeoutExpired
+    ev = eval_from_reward("FLAKY-001", reward, "job", k=2)
+    assert ev.S == 0.5
+    assert ev.missing == 1
+    assert ev.n_expected == 2  # denominator kept: 1 group x k=2
+
+
+def test_all_trials_missing_counts_zero(tmp_path):
+    """Both trials time out: S is 0.0, missing is 2, denominator still 2."""
+    from rsi.selection import eval_from_reward
+
+    task = _flaky_task(tmp_path, fail_first=99, sleep_first=True, k=2)
+    reward = run_verifier(tmp_path, task, tmp_path / "evidence")
+    check = reward.tiers["A"]["checks"][0]
+    assert len(check["trials"]) == 2
+    assert all(t["missing"] for t in check["trials"])
+    ev = eval_from_reward("FLAKY-001", reward, "job", k=2)
+    assert ev.S == 0.0 and ev.missing == 2 and ev.n_expected == 2
