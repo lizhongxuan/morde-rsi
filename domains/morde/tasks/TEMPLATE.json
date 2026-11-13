@@ -1,0 +1,40 @@
+{
+  "_doc": "TEMPLATE, not a real task. Copy this shape into tasks/evolve.json when adding a real bug. Tier B uses go-test-json + suite-ran (per-test P2P); tiers A/C use go-test-json + all-pass. See docs/rrsi-mapping.md for why whole-package pass/fail cannot be the gate on Morde.",
+  "task_id": "MORDE-0000",
+  "title": "一句话描述 bug",
+  "description": "怎么复现：前置条件、操作步骤、实际结果、期望结果。",
+  "repro": "让验证器先失败的证据：哪条测试现在失败，或哪条命令现在报错。",
+  "component": "logic-small",
+  "hypothesis": "为什么这个修法应该有效（一句话）。",
+  "behavior_change": "修完后用户能观察到的行为变化（一句话，不写代码改动；审批卡上就显示这句）。",
+  "behavior_tests": ["断言上述行为的测试文件/测试名，如 src/routes/Projects.test.tsx。单点 P2P 失败时，若未过的测试正在此列，裁决走 NEEDS_HUMAN 而不是自动 REJECT。"],
+  "tiers": {
+    "A": {
+      "commands": [
+        {"cwd": "server", "argv": ["go", "build", "./..."]},
+        {"cwd": "server", "argv": ["go", "vet", "./..."]},
+        {"cwd": "server", "argv": ["go", "test", "-json", "./internal/xxx", "-run", "TestXxx", "-count=1"], "format": "go-test-json"}
+      ],
+      "timeout_s": 600
+    },
+    "B": {
+      "commands": [
+        {"cwd": "server", "argv": ["go", "test", "-json", "./internal/xxx", "-count=1"], "format": "go-test-json"},
+        {"cwd": "web/portal", "argv": ["npm", "run", "typecheck"]},
+        {"cwd": "web/portal", "argv": ["npm", "run", "test"]}
+      ],
+      "timeout_s": 900,
+      "mode": "suite-ran"
+    },
+    "C": {
+      "commands": [
+        {"cwd": "server", "argv": ["go", "test", "-json", "./internal/xxx", "-run", "TestHeldout", "-count=1"], "format": "go-test-json"}
+      ],
+      "timeout_s": 900,
+      "heldout": {
+        "src": "tasks/heldout/MORDE-0000",
+        "dest": "server/internal/xxx"
+      }
+    }
+  }
+}
