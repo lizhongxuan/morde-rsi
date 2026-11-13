@@ -304,3 +304,115 @@ python3 -m venv .venv
 - 需求草案 CO-0007（2026-11-12，用户上传，draft，未实现）：Morde 小功能自动开发与 RSI 自循环优化；两阶段（小功能自动开发 → RSI 自循环）；RSI 是独立项目；两个待确认未定（最终自动更新到哪里；“重大功能”判定口径）。
 - RSI 深度研究（2026-11-12，页面“RSI 深度研究”）：fixer → 独立确定性验证器在全新隔离副本里打分 → 只有比基线好过噪声才采纳；最值得借的是 RRSI（git worktree + 证据账本 + 噪声下限 + 防泄漏 critic）和 OpenRSI 的 Work/Judge 分离。
 - 建造决定（2026-11-13，用户确认）：RRSI 当骨架、DSH 当执行器、不 fork 任何整项目。
+
+---
+
+## 9. 服务层（2026-11-13 新增）
+
+> 本节由服务层并行分工写就，2026-11-13 由集成协调人跑通整条链路并复核
+> （见 9.5）：全套 pytest 243 passed、check-config、真服务 + 本地桩模型
+> 提交任务走完全程到 ADOPT。下表"已验证"表示集成时实跑通过。
+
+### 9.1 建了什么
+
+HTTP 服务，把本地 RSI 循环包起来：外部提交任务 → 后台跑循环 → 写证据 →
+落收据；ADOPT 只产分支，永不自动合并；需要时创建 PR 供人工审阅。
+
+| 模块 | 文件 | 职责 |
+|---|---|---|
+| 配置 | `service/config.py`、`service/config.example.json` | `load_config(path=None) -> dict`、`resolve_data_dir(cfg) -> Path`；默认 host `127.0.0.1`、port `8765`、`data_dir` `runs/service`；`api_token` 可由 `RSI_API_TOKEN` 提供 |
+| 任务存储 | `service/store.py` | `JobStore`：`create_job` / `get_job` / `list_jobs` / `update_job` / `claim_next` / `cancel_job`；状态 `queued` / `running` / `done` / `failed` / `cancelled` |
+| HTTP 层 | `service/server.py`（已验证） | `GET /health`（公开）；`POST /v1/jobs` → 202 `{job_id, status: queued}`；`GET /v1/jobs`；`GET /v1/jobs/{id}`；`GET /v1/jobs/{id}/evidence`；`POST /v1/jobs/{id}/feedback`（`{kind, label?, note?, round?}`）；`POST /v1/jobs/{id}/cancel`；`GET /v1/frontier?domain=`；全部 `/v1/*` 要 Bearer token |
+| 工作进程 | `service/worker.py`（已验证） | `Worker(config, store)` 轮询队列，调 `rsi/controller.py` 跑循环；裁决 `ADOPT` / `REJECT` / `NEEDS_HUMAN` / `STUCK` / `GAMING-DETECTED` / `SKIPPED`；ADOPT 只建分支 `rsi/<task-id>`，永不合并 |
+| 模型 Fixer | `service/fixer_api.py`（已验证） | `APIFixer`：POST `{base_url}/chat/completions`，提取 ` ```diff ` 代码块，`git apply --check` 校验；429/5xx 最多重试 2 次（2 秒、8 秒）；受 `max_usd_per_job` 约束 |
+| 收据 | `service/receipt.py`（已验证） | 每任务一张收据 JSON：`{job_id, tokens_in, tokens_out, usd, wall_seconds, verdict, branch, pr_url}`，落盘 `<data_dir>/receipts/<job_id>.json`；`usd` 为 `null` 表示未配置价格、不计费 |
+| PR | `service/github_pr.py`（**已验证**，见 9.3） | `render_pr_body()` 纯函数产 PR 正文；`create_pr()` 有 `gh` 时用 `gh pr create`，否则走 GitHub REST API；无 origin / 解析不出 GitHub 地址 / 无 token 时返回 `None`；**模块里没有任何合并代码** |
+| 入口 | `service.py`（已验证） | `python3 service.py serve`、`python3 service.py check-config` |
+| 容器 | `Dockerfile`（已验证写法，未实际构建，见 9.4） | `python:3.12-slim`，`CMD ["python3", "service.py", "serve"]`，`EXPOSE 8765` |
+
+### 9.2 怎么跑（已验证，见 9.5）
+
+```bash
+cp service/config.example.json service/config.json
+export RSI_API_TOKEN='长随机串' DEEPSEEK_API_KEY='你的 DeepSeek key'
+python3 service.py check-config
+python3 service.py serve
+```
+
+curl 示例（提交 / 查任务 / 取证据 / 反馈 / 取消）见 `service/README.md`。
+Docker：`docker build -t morde-rsi-service .` 后
+`docker run -p 8765:8765 -e RSI_API_TOKEN=... -e DEEPSEEK_API_KEY=... morde-rsi-service`；
+morde domain 的仓库路径须在容器内存在或改配置覆盖（见 `service/README.md`）。
+
+### 9.3 作者本人验证过的部分
+
+- `service/github_pr.py` + `service/tests/test_github_pr.py`：
+  `cd ~/workspace/morde-rsi && .venv/bin/python -m pytest service/tests/test_github_pr.py -q`
+  实测 **10 passed in 1.24s**（2026-11-13）。覆盖：PR 正文含裁决/基线与候选
+  分数/分层通过失败/tokens/usd 为 null 时写"未配置价格，未计费"/分支/
+  永不自动合并；无 origin 返回 `None`；origin 是 GitHub 地址但无 token
+  且无 `gh` 时返回 `None`；本地桩 HTTP 服务器上 REST 建 PR 成功返回
+  `https://github.com/o/r/pull/1` 且请求 JSON 含 title/head/base/body；
+  REST 422 抛 `RuntimeError`。注意：本机装有 `gh`（`/usr/bin/gh`），
+  无 token 的测试用 monkeypatch 把 `shutil.which` 挡掉才走到 REST 分支。
+- `service/config.example.json` 已读过：默认值与第 9.1 节的表一致
+  （host `127.0.0.1`、port `8765`、fixer 默认 DeepSeek `deepseek-chat`、
+  价格两项 `null`、`github.create_pr: false`）。
+- `service/README.md`（完整中文文档）与根 `README.md` 末尾的
+  "## 服务（service/）"一节是作者本人写的；集成时已按文档跑通
+  （check-config、serve、curl 提交/查询/证据/反馈，见 9.5），
+  只有 Docker 构建未实际跑过，见 9.4。
+- 未动 `rsi/`、`domains/`、`scripts/`、`pyproject.toml`、`refs/`、
+  `runs/`、`/home/hatch/workspace/morde-check`；未执行 `git push`；
+  未写任何密钥进文件；只用标准库（`urllib`、`subprocess`）。
+
+### 9.4 仍是桩 / 后续工作
+
+1. **DSHFixer 仍是桩**（见第 5 节③）：服务用的是 `APIFixer`（直接调
+   OpenAI 兼容接口），不是 DSH Task。接 DSHFixer 仍是独立待办。
+2. **Docker 版 Judge 隔离没有**：当前隔离是 v1 级别（每任务独立 git
+   worktree），与本地循环一致；不要把服务暴露给不可信的任务来源。
+3. **私有仓库与多租户/计费不在范围**：PR 创建假定仓库的 origin 是
+   GitHub 公开可解析地址；多租户账号、计费是明确的 out of scope。
+4. **Docker 构建未实际跑过**：Dockerfile 按约定写的
+   （python:3.12-slim，`CMD ["python3", "service.py", "serve"]`），
+   但集成时没有跑 `docker build` / `docker run`；先跑通再声称可用。
+5. **目标仓库必须配好 git 身份**：采纳时 Controller 要 `git commit`，
+   目标仓库（或全局）没有 user.name/user.email 会让任务以 failed
+   告终（实测：首次 live 任务即因此失败）。部署前给目标仓库设好
+   `git config user.name / user.email`，或在服务环境变量里配
+   GIT_AUTHOR_NAME 等；见 service/README.md 故障排查。
+6. **Controller 在 commit 失败时漏清理 worktree**：rsi/controller.py
+   的 ADOPT 分支里 `commit_worktree` 抛错会跳过后续的 worktree 清理，
+   残留的 judge worktree 占着 `rsi/<task-id>` 分支，导致同一任务下一
+   次运行在 `git worktree add -b` 处失败（实测）。这是 rsi/ 里的旧问
+   题（服务层不改 rsi/，未修）；清掉办法：`git worktree remove --force
+   <残留路径>` + `git branch -D rsi/<task-id>`。
+7. **self domain 目前接不了 LLM Fixer**：domains/self/SKILL.md 逐字
+   写了 `telemetry.jsonl` / `human_feedback.jsonl`，而
+   rsi/critic.py::review_brief 拒收任何含这两个文件名的任务书，所以
+   APIFixer（DSHFixer 也一样，它走同一检查）在 self domain 上没调
+   模型就抛错。E2E 测试因此用 morde domain 跑；墙本身已钉成测试
+   `test_api_fixer_self_skill_md_blocked`。修法在 rsi/critic.py（收窄
+   账本文件名模式）或 domains/self/SKILL.md（不逐字写文件名）二选一。
+
+### 9.5 集成验证记录（2026-11-13，协调人实跑）
+
+- 全套测试：`cd ~/workspace/morde-rsi && .venv/bin/python -m pytest tests service/tests -q`
+  → **243 passed in 51.18s**（原有 161 + 服务层 82）。注意 pyproject.toml
+  的 testpaths 只含 tests，必须显式带两个路径；不要改 pyproject.toml。
+- 集成时修掉两个问题：(1) service/tests/conftest.py 与 tests/conftest.py
+  同名冲突（`from conftest import FIX_DIFF` 拿到错的文件），已删除
+  service/tests/conftest.py，各测试文件自带 sys.path 引导；(2) worker
+  沿用 rsi.py 的 `import adapter` 会在长驻进程里跨 domain 串线（先 import
+  过 self adapter，后来的 morde 任务会拿到 self 的 SKILL.md），已改成按
+  文件位置、用 per-domain 模块名加载，并加回归测试
+  test_load_domain_not_poisoned_by_top_level_adapter_import。
+- check-config：example 配置与 live 配置都 exit 0。
+- 真服务端到端（本地桩模型，/tmp/rsi-live）：服务起在 127.0.0.1:18765，
+  fixer 指向本地桩模型服务器；curl 提交 morde domain 内联任务 → 202
+  queued；轮询到 done，裁决 ADOPT，基线 0.3333 → 候选 1.0，三层全过，
+  分支 rsi/E2E-001，收据 tokens 100/50、usd 0.0002；/evidence 返回 reward
+  score 1.0 与 A/B/C 三层日志；/feedback 写进 human_feedback.jsonl；
+  /frontier 返回采纳后的 frontier。另有两轮失败在先（缺 git 身份、残留
+  worktree），见 9.4 第 5、6 条——都是环境/旧代码问题，不是服务层 bug。

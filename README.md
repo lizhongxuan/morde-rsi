@@ -169,3 +169,34 @@ JSON 的可选字段，见 `domains/morde/tasks/TEMPLATE.json`。
 ## 许可证
 
 Apache-2.0（与 RRSI 一致），见 `LICENSE`。
+
+## 服务（service/）
+
+把本地 RSI 循环包成 HTTP 服务：外部提交任务，服务在后台跑循环、
+写证据、落收据；ADOPT 只产分支 `rsi/<task-id>`，永不自动合并，
+需要时由 `service/github_pr.py` 创建 PR 供人工审阅。
+
+启动（三条命令）：
+
+```bash
+cp service/config.example.json service/config.json
+export RSI_API_TOKEN='长随机串' DEEPSEEK_API_KEY='你的 DeepSeek key'
+python3 service.py check-config   # 校验配置
+python3 service.py serve          # 默认 127.0.0.1:8765
+```
+
+- 提交任务：`POST /v1/jobs`（Bearer token，202 + `job_id`）；
+  查任务：`GET /v1/jobs/{id}`；取证据：`GET /v1/jobs/{id}/evidence`；
+  反馈：`POST /v1/jobs/{id}/feedback`；取消：`POST /v1/jobs/{id}/cancel`；
+  查基线：`GET /v1/frontier?domain=morde`。`/health` 公开。
+- Fixer 走 OpenAI 兼容接口（默认 DeepSeek），费用只按配置里的单价算，
+  未配价格时收据 `usd` 为 `null`、不编造数字；每任务有费用上限
+  `budgets.max_usd_per_job`。
+- 密钥（`RSI_API_TOKEN` / `DEEPSEEK_API_KEY` / `GITHUB_TOKEN`）只走
+  环境变量，绝不写进配置文件。
+- 隔离是 v1 级别（每任务独立 git worktree）；Docker 版 Judge 隔离是
+  后续工作，当前没有。
+
+完整文档见 `service/README.md`（配置全表、API 参考、安全与排障）。
+
+多租户账号 / 计费不在范围：这是单租户本地服务，不要当多用户 SaaS 用。
